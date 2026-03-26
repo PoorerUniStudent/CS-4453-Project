@@ -1,0 +1,14 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+
+# Environment
+.venv/
+.env
+.python-version
+
+# Notebooks
+.ipynb_checkpoints/
