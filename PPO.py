@@ -143,27 +143,48 @@ def get_input_dims_from_env() -> tuple:
 # ──────────────────────────────────────────────
 class RewardWrapper(gym.Wrapper):
     """
-    Optional reward wrapper for CarRacing.
+    Wraps CarRacing to allow experimenting with different reward signals.
 
     Modes:
-      - "default": use environment reward unchanged
-      - "clip":    clip rewards to [-1, 1]
+      - "default"    : Use the environment's built-in reward unchanged.
+      - "clip"       : Clip rewards to [-1, +1] for training stability.
+      - "speed"      : Add a small bonus proportional to the car's speed,
+                       encouraging the agent to drive faster.
+      - "custom"     : Override `custom_reward()` for your own design.
+
+    Allows studying of reward shaping affects of driving behavior,
+    as described in the project proposal.
     """
+
     def __init__(self, env: gym.Env, mode: str = "default"):
         super().__init__(env)
         self.mode = mode
+        self._prev_reward = 0.0
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
+        reward = self._shape_reward(reward, obs, terminated, truncated, info)
+        return obs, reward, terminated, truncated, info
 
+    def _shape_reward(self, reward, obs, terminated, truncated, info):
         if self.mode == "default":
-            shaped_reward = reward
+            return reward
         elif self.mode == "clip":
-            shaped_reward = float(np.clip(reward, -1.0, 1.0))
+            return float(np.clip(reward, -1.0, 1.0))
+        elif self.mode == "speed":
+            # Car's true speed is rendered in the observation but not
+            # directly exposed; we approximate via reward delta as a proxy.
+            speed_bonus = 0.01 * max(reward - self._prev_reward, 0)
+            self._prev_reward = reward
+            return reward + speed_bonus
+        elif self.mode == "custom":
+            return self._custom_reward(reward, obs, terminated, truncated, info)
         else:
-            raise ValueError(f"Unknown reward mode: {self.mode}")
+            raise ValueError(f"Unknown reward mode: '{self.mode}'")
 
-        return obs, shaped_reward, terminated, truncated, info
+    def _custom_reward(self, reward, obs, terminated, truncated, info):
+        """Override this method in a subclass for fully custom rewards."""
+        return reward
 
 
 # ──────────────────────────────────────────────
