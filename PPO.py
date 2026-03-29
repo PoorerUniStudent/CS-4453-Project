@@ -39,12 +39,12 @@ from torch.distributions.categorical import Categorical
 # ──────────────────────────────────────────────
 # Hyperparameters
 # ──────────────────────────────────────────────
-LEARNING_RATE      = 3e-4       # Adam learning rate
+LEARNING_RATE      = 5e-5       # Adam learning rate
 GAMMA              = 0.99       # Discount factor
 GAE_LAMBDA         = 0.95       # GAE lambda
 POLICY_CLIP        = 0.2        # PPO clipping epsilon
 BATCH_SIZE         = 64         # Mini-batch size
-ROLLOUT_STEPS      = 2048       # Number of env steps before each PPO update
+ROLLOUT_STEPS      = 4096       # Number of env steps before each PPO update
 N_EPOCHS           = 10         # PPO training epochs per rollout
 TOTAL_TIMESTEPS    = 300_000    # Total training steps
 EVAL_EVERY         = 10_000     # Evaluate every N steps
@@ -57,7 +57,6 @@ NORMALIZE_OBS      = True       # Normalize grayscale pixels to [0, 1]
 
 # Output / checkpointing
 SAVE_DIR           = "ppo_results"
-CHECKPOINT_EVERY   = 50_000
 
 # Rendering
 RENDER_EPISODES    = 5
@@ -515,13 +514,13 @@ class PPOAgent:
         self,
         n_actions,
         input_dims,
-        alpha=0.0003,
-        gamma=0.99,
-        gae_lambda=0.95,
-        policy_clip=0.2,
-        batch_size=64,
-        N=2048,
-        n_epochs=10
+        alpha=LEARNING_RATE,
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        policy_clip=POLICY_CLIP,
+        batch_size=BATCH_SIZE,
+        N=ROLLOUT_STEPS,
+        n_epochs=N_EPOCHS
     ):
         """
         Args:
@@ -546,6 +545,7 @@ class PPOAgent:
             n_epochs (int): number of times PPO trains over collected rollout data
                             Common: 3 to 10
         """
+        self.alpha = alpha                    # Learning rate for optimizers
         self.gamma = gamma                    # Discount factor for future rewards
         self.gae_lambda = gae_lambda          # Controls bias/variance tradeoff in GAE
         self.policy_clip = policy_clip        # PPO clipping threshold
@@ -574,7 +574,7 @@ class PPOAgent:
         """
         Saves both actor and critic parameters into one .pt checkpoint file.
         """
-        print('... saving models ...')
+        print('... saving model ...')
         T.save({
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict()
@@ -584,7 +584,8 @@ class PPOAgent:
         """
         Loads both actor and critic parameters from one .pt checkpoint file.
         """
-        print('... loading models ...')
+        print('... loading model ...')
+        filepath = os.path.join(SAVE_DIR, filepath)
         checkpoint = T.load(filepath, map_location=self.actor.device)
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
@@ -843,7 +844,7 @@ def train_ppo_on_carracing(
     log_file = os.path.join(save_dir, "progress.csv")
     if not os.path.exists(log_file):
         with open(log_file, "w") as f:
-            f.write("step,eval_reward\n")
+            f.write("step,reward\n")
 
     env = make_env(render=False, reward_mode=reward_mode, seed=seed)
     obs, info = env.reset(seed=seed)
@@ -916,15 +917,13 @@ def train_ppo_on_carracing(
                 f.write(f"{step},{avg_reward}\n")
 
         # Periodic checkpoint
-        if step % CHECKPOINT_EVERY == 0:
+        if step % EVAL_EVERY == 0:
             checkpoint_dir = os.path.join(save_dir, f"ppo_car_{step}.pt")
-            os.makedirs(checkpoint_dir, exist_ok=True)
             agent.save_models(checkpoint_dir)
 
     # Final save
-    final_dir = os.path.join(save_dir, "final_model")
-    os.makedirs(final_dir, exist_ok=True)
-    agent.save_models(final_dir)
+    final_path = os.path.join(save_dir, "ppo_car_final.pt")
+    agent.save_models(final_path)
 
     env.close()
     print(f"[PPO] Training complete! Results saved to {save_dir}")
@@ -963,10 +962,10 @@ def parse_args():
     # Rendering / loading
     parser.add_argument("--render", action="store_true", help="Render a trained PPO agent.")
     parser.add_argument(
-        "--checkpoint-dir",
+        "--checkpoint",
         type=str,
         default=None,
-        help="Directory containing actor_torch_ppo and critic_torch_ppo"
+        help="Path to a PPO .pt checkpoint file."
     )
 
     return parser.parse_args()
@@ -980,8 +979,8 @@ if __name__ == "__main__":
 
     # Render mode
     if args.render:
-        if args.checkpoint_dir is None:
-            print("[PPO] Error: Must provide --checkpoint-dir to render a trained model.")
+        if args.checkpoint is None:
+            print("[PPO] Error: Must provide --checkpoint to render a trained model.")
         else:
             # Create a dummy env just to get action space size
             dummy_env = make_env(render=False, reward_mode=args.reward_mode, seed=args.seed)
@@ -1000,7 +999,7 @@ if __name__ == "__main__":
 
             render_agent(
                 agent=agent,
-                checkpoint_dir=args.checkpoint_dir,
+                checkpoint_dir=args.checkpoint,
                 reward_mode=args.reward_mode,
                 episodes=RENDER_EPISODES
             )
