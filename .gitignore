@@ -20,6 +20,7 @@ sac_results/
 test_run/
 final_pro_drive/
 CHAMPION_*.pt
+sac_speed_run_v2/
 
 .vscode
 pyrightconfig.json

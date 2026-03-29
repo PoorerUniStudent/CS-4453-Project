@@ -147,29 +147,38 @@ class RewardWrapper(gym.Wrapper):
             self._prev_reward = reward
             return reward + speed_bonus
         elif self.mode == "speed":
-            # Small bonus for velocity magnitude
+            # Small bonus for velocity magnitude, only if making progress.
+            making_progress = reward > 0
             vel = self.env.unwrapped.car.hull.linearVelocity
             speed = np.sqrt(np.sum(np.square(vel)))
-            return reward + 0.1 * speed
+            speed_bonus = 0.1 * speed if making_progress else 0.0
+            return reward + speed_bonus
         elif self.mode == "precision":
             # 1. Base reward
-            # 2. Speed bonus (forward only)
+            # 2. Speed bonus (forward only, progress-gated)
             # 3. Spinning penalty (angular velocity)
             # 4. Backward sliding penalty
             car = self.env.unwrapped.car
             vx, vy = car.hull.linearVelocity
             angle = car.hull.angle
+            speed = np.sqrt(vx**2 + vy**2)
             
             # Unit vector of the car's nose (Box2D CarRacing specific)
             unit_x, unit_y = -np.sin(angle), np.cos(angle)
             forward_speed = vx * unit_x + vy * unit_y
             
+            # Progress Gate: Only reward speed if actually hitting NEW tiles
+            making_progress = reward > 0
+            
             # Bonuses and Penalties
-            speed_bonus = 0.1 * max(forward_speed, 0)
+            speed_bonus = 0.1 * max(forward_speed, 0) if making_progress else 0.0
             spin_penalty = 0.5 * abs(car.hull.angularVelocity)
             backward_penalty = 5.0 if forward_speed < -1.0 else 0.0
             
-            return reward + speed_bonus - spin_penalty - backward_penalty
+            # Fail-Safe: Penalty for moving fast but NOT making progress (wrong way/off-track)
+            progress_penalty = 1.0 if (not making_progress and speed > 5.0) else 0.0
+            
+            return reward + speed_bonus - spin_penalty - backward_penalty - progress_penalty
         elif self.mode == "custom":
             return self._custom_reward(reward, obs, terminated, truncated, info)
         else:
@@ -585,7 +594,7 @@ def parse_args():
         "--reward-mode",
         type=str,
         default="default",
-        choices=["default", "clip", "speed", "precision", "custom"],
+        choices=["default", "clip", "oldspeed", "speed", "precision", "custom"],
         help="Reward wrapper mode for experimentation.",
     )
 
