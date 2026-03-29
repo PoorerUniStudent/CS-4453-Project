@@ -35,6 +35,7 @@ import torch as T
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.normal import Normal
+from collections import deque
 
 # ──────────────────────────────────────────────
 # Hyperparameters
@@ -53,6 +54,7 @@ SEED               = 42         # Random seed
 
 # Observation preprocessing
 NORMALIZE_OBS      = True       # Normalize grayscale pixels to [0, 1]
+FRAME_STACK        = 4          # Number of consecutive grayscale frames to stack
 
 # Output / checkpointing
 SAVE_DIR           = "ppo_results"
@@ -93,34 +95,71 @@ def set_seed(seed: int):
 def preprocess_observation(obs: np.ndarray,
                            normalize: bool = NORMALIZE_OBS) -> np.ndarray:
     """
-    Convert CarRacing RGB observation into a flattened grayscale vector.
+    Convert one CarRacing RGB observation into one grayscale frame.
 
     Steps:
       1. RGB -> grayscale
       2. Normalize to [0, 1] if requested
-      3. Flatten into shape (96 * 96,)
 
     Args:
         obs: Raw CarRacing observation, shape (96, 96, 3)
         normalize: Whether to scale pixel values to [0, 1]
 
     Returns:
-        1D float32 NumPy array.
+        2D float32 NumPy array of shape (96, 96).
     """
-    # Convert RGB to grayscale using standard luminance weights
     gray = np.dot(obs[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
 
     if normalize:
         gray /= 255.0
 
-    return gray.flatten().astype(np.float32)
+    return gray
+
+
+class FrameStack:
+    """
+    Maintains a stack of the last `n` grayscale frames.
+
+    Since the PPO agent uses an MLP, the stacked frames are flattened before
+    being passed into the network.
+    """
+    def __init__(self, n: int = FRAME_STACK):
+        self.n = n
+        self.frames = deque(maxlen=n)
+
+    def reset(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Reset the frame stack using the initial observation.
+        Fills the stack with the same first frame `n` times.
+        """
+        frame = preprocess_observation(obs)
+        self.frames.clear()
+        for _ in range(self.n):
+            self.frames.append(frame)
+        return self._get_stacked()
+
+    def step(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Push a new frame and return the updated stacked observation.
+        """
+        frame = preprocess_observation(obs)
+        self.frames.append(frame)
+        return self._get_stacked()
+
+    def _get_stacked(self) -> np.ndarray:
+        """
+        Return stacked frames flattened into a 1D vector for the MLP.
+        Shape: (FRAME_STACK * 96 * 96,)
+        """
+        stacked = np.array(self.frames, dtype=np.float32)
+        return stacked.flatten()
 
 
 def get_input_dims_from_env() -> tuple:
     """
-    Returns the flattened observation shape expected by the PPO networks.
+    Returns the flattened stacked observation shape expected by the PPO networks.
     """
-    return (96 * 96,)
+    return (FRAME_STACK * 96 * 96,)
 
 
 # ──────────────────────────────────────────────
@@ -156,12 +195,45 @@ class RewardWrapper(gym.Wrapper):
             return reward
         elif self.mode == "clip":
             return float(np.clip(reward, -1.0, 1.0))
-        elif self.mode == "speed":
+        elif self.mode == "oldspeed": # first speed run reward
             # Car's true speed is rendered in the observation but not
             # directly exposed; we approximate via reward delta as a proxy.
             speed_bonus = 0.01 * max(reward - self._prev_reward, 0)
             self._prev_reward = reward
             return reward + speed_bonus
+        elif self.mode == "speed":
+            # Small bonus for velocity magnitude, only if making progress.
+            making_progress = reward > 0
+            vel = self.env.unwrapped.car.hull.linearVelocity
+            speed = np.sqrt(np.sum(np.square(vel)))
+            speed_bonus = 0.1 * speed if making_progress else 0.0
+            return reward + speed_bonus
+        elif self.mode == "precision":
+            # 1. Base reward
+            # 2. Speed bonus (forward only, progress-gated)
+            # 3. Spinning penalty (angular velocity)
+            # 4. Backward sliding penalty
+            car = self.env.unwrapped.car
+            vx, vy = car.hull.linearVelocity
+            angle = car.hull.angle
+            speed = np.sqrt(vx**2 + vy**2)
+            
+            # Unit vector of the car's nose (Box2D CarRacing specific)
+            unit_x, unit_y = -np.sin(angle), np.cos(angle)
+            forward_speed = vx * unit_x + vy * unit_y
+            
+            # Progress Gate: Only reward speed if actually hitting NEW tiles
+            making_progress = reward > 0
+            
+            # Bonuses and Penalties
+            speed_bonus = 0.1 * max(forward_speed, 0) if making_progress else 0.0
+            spin_penalty = 0.5 * abs(car.hull.angularVelocity)
+            backward_penalty = 5.0 if forward_speed < -1.0 else 0.0
+            
+            # Fail-Safe: Penalty for moving fast but NOT making progress (wrong way/off-track)
+            progress_penalty = 1.0 if (not making_progress and speed > 5.0) else 0.0
+            
+            return reward + speed_bonus - spin_penalty - backward_penalty - progress_penalty
         elif self.mode == "custom":
             return self._custom_reward(reward, obs, terminated, truncated, info)
         else:
@@ -530,78 +602,66 @@ class PPOAgent:
     def choose_action(self, observation):
         """
         Select a continuous action using the current Gaussian policy.
+
+        Returns:
+            env_action : action sent to the CarRacing environment
+            probs      : log-probability of the RAW sampled action
+            value      : critic estimate V(s)
+            raw_action : raw Gaussian sample stored for PPO training
         """
         state = T.tensor([observation], dtype=T.float).to(self.actor.device)
 
         dist = self.actor(state)
         value = self.critic(state)
 
-        action = dist.sample()
+        # Sample RAW action from Gaussian policy
+        raw_action = dist.sample()
 
-        # Sum log-probs across action dimensions
-        probs = T.sum(dist.log_prob(action), dim=-1).item()
+        # PPO should store log-prob of the RAW action
+        probs = dist.log_prob(raw_action).sum(dim=-1)
+        probs = T.squeeze(probs).item()
 
-        action = T.squeeze(action).cpu().numpy()
+        # Transform raw action into valid CarRacing controls
+        env_action = raw_action.clone()
+
+        # steering in [-1, 1]
+        env_action[..., 0] = T.tanh(env_action[..., 0])
+
+        # gas in [0.2, 1.0] so the car actually accelerates
+        env_action[..., 1] = 0.2 + 0.8 * T.sigmoid(env_action[..., 1])
+
+        # brake in [0, 1]
+        env_action[..., 2] = T.sigmoid(env_action[..., 2])
+
+        env_action = T.squeeze(env_action).detach().cpu().numpy()
+        raw_action = T.squeeze(raw_action).detach().cpu().numpy()
         value = T.squeeze(value).item()
 
-        # CarRacing continuous actions:
-        # steering in [-1, 1]
-        # gas in [0, 1]
-        # brake in [0, 1]
-        action[0] = np.clip(action[0], -1.0, 1.0)
-        action[1] = np.clip(action[1],  0.0, 1.0)
-        action[2] = np.clip(action[2],  0.0, 1.0)
-
-        return action, probs, value
+        return env_action, probs, value, raw_action
         
     def learn(self):
         """
         Performs PPO training using all data currently stored in memory.
 
-        Main steps:
-            1) Get rollout data and shuffled batches
-            2) Compute advantages using GAE-like calculation
-            3) For each mini-batch:
-                - compute new action log-probs
-                - compute probability ratio
-                - compute clipped actor loss
-                - compute critic loss
-                - backpropagate total loss
-            4) Clear memory after training
-
-        Important:
-            PPO compares:
-                new policy probability / old policy probability
-            for the SAME actions from the rollout.
-
-        Loss terms:
-            actor_loss  : clipped PPO objective
-            critic_loss : MSE between predicted value and target return
-            total_loss  : actor_loss + 0.5 * critic_loss
-
-        Note:
-            This implementation does not include:
-                - entropy bonus
-                - normalization of advantages
-                - explicit use of N
-            which are often included in stronger PPO implementations.
+        Important for continuous control:
+            - the stored actions must be the RAW Gaussian samples
+            - log-probs are computed on those raw actions
+            - only the environment receives the transformed action
         """
         for _ in range(self.n_epochs):
             # Retrieve stored rollout data and mini-batches
             state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, batches = self.memory.generate_batches()
-            
-            values = vals_arr  # Old critic predictions stored during rollout
+
+            values = vals_arr
 
             # Advantage array stores how much better/worse an action was than expected
             advantage = np.zeros(len(reward_arr), dtype=np.float32)
-            
-            # Compute advantage for each timestep
-            # This is a backward-looking sum of TD errors with discounting
-            for t in range(len(reward_arr) - 1):
-                discount = 1   # cumulative discount factor: (gamma * lambda)^k
-                a_t = 0        # advantage at timestep t
 
-                # Accumulate future TD residuals from timestep t onward
+            # Compute advantage for each timestep
+            for t in range(len(reward_arr) - 1):
+                discount = 1
+                a_t = 0
+
                 for k in range(t, len(reward_arr) - 1):
                     a_t += discount * (
                         reward_arr[k]
@@ -611,70 +671,48 @@ class PPOAgent:
                     discount *= self.gamma * self.gae_lambda
 
                 advantage[t] = a_t
-            
-            # Convert advantages to tensor on same device as networks
-            advantage = T.tensor(advantage).to(self.actor.device)
-            
-            # Convert stored values to tensor
-            values = T.tensor(values).to(self.actor.device)
-            
-            # Train on each mini-batch
+
+            advantage = T.tensor(advantage, dtype=T.float).to(self.actor.device)
+            values = T.tensor(values, dtype=T.float).to(self.actor.device)
+
             for batch in batches:
                 # Extract batch data and convert to tensors
                 states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
-                old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
+                old_probs = T.tensor(old_prob_arr[batch], dtype=T.float).to(self.actor.device)
                 actions = T.tensor(action_arr[batch], dtype=T.float).to(self.actor.device)
-                
+
                 # Forward pass through actor and critic with CURRENT parameters
                 dist = self.actor(states)
-                critic_value = self.critic(states)
-                
-                critic_value = critic_value.squeeze()  # shape [batch_size]
-                
-                # New log-probabilities of the same actions under updated policy
+                critic_value = self.critic(states).squeeze()
+
+                # Log-prob of the SAME RAW actions under updated policy
                 new_probs = dist.log_prob(actions).sum(dim=-1)
 
-                # Probability ratio:
-                # ratio = exp(new_log_prob) / exp(old_log_prob)
-                #       = pi_new(a|s) / pi_old(a|s)
-                prob_ratio = new_probs.exp() / old_probs.exp()
+                # Probability ratio
+                prob_ratio = (new_probs - old_probs).exp()
 
-                # Standard PPO surrogate objective
+                # PPO clipped objective
                 weighted_probs = advantage[batch] * prob_ratio
-
-                # Clipped surrogate objective
                 weighted_clipped_probs = T.clamp(
                     prob_ratio,
                     1 - self.policy_clip,
                     1 + self.policy_clip
                 ) * advantage[batch]
 
-                # PPO actor loss is negative because we want to maximize objective
                 actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
-                
-                # Return target = advantage + old value estimate
-                # Since A(s,a) = return - value, then return = A + V
-                returns = advantage[batch] + values[batch]
 
-                # Critic tries to predict returns
-                critic_loss = (returns - critic_value) ** 2
-                critic_loss = critic_loss.mean()
-                
-                # Total loss: actor + scaled critic loss
+                # Critic target = return = advantage + old value estimate
+                returns = advantage[batch] + values[batch]
+                critic_loss = ((returns - critic_value) ** 2).mean()
+
                 total_loss = actor_loss + 0.5 * critic_loss
-                
-                # Clear old gradients
+
                 self.actor.optimizer.zero_grad()
                 self.critic.optimizer.zero_grad()
-
-                # Backpropagate total loss
                 total_loss.backward()
-
-                # Update parameters
                 self.actor.optimizer.step()
                 self.critic.optimizer.step()
-        
-        # PPO is on-policy, so after learning from rollout, clear it
+
         self.memory.clear_memory()
 
 
@@ -686,25 +724,24 @@ def evaluate_agent(agent: PPOAgent,
                    reward_mode: str = "default",
                    seed: int = SEED) -> float:
     """
-    Evaluate the PPO agent on CarRacing-v3.
-
-    For simplicity, this uses the same stochastic policy sampling that your
-    current choose_action() function uses.
+    Evaluate the PPO agent on CarRacing-v3 using stacked frames.
     """
     eval_env = make_env(render=False, reward_mode=reward_mode, seed=seed + 100)
     total_reward = 0.0
 
     for ep in range(num_episodes):
         obs, info = eval_env.reset(seed=seed + 100 + ep)
-        state = preprocess_observation(obs)
+
+        frame_stack = FrameStack(n=FRAME_STACK)
+        state = frame_stack.reset(obs)
 
         done = False
         ep_reward = 0.0
 
         while not done:
-            action, prob, val = agent.choose_action(state)
-            next_obs, reward, terminated, truncated, info = eval_env.step(action)
-            state = preprocess_observation(next_obs)
+            env_action, prob, val, raw_action = agent.choose_action(state)
+            next_obs, reward, terminated, truncated, info = eval_env.step(env_action)
+            state = frame_stack.step(next_obs)
 
             ep_reward += reward
             done = terminated or truncated
@@ -720,21 +757,24 @@ def render_agent(agent: PPOAgent,
                  reward_mode: str = "default",
                  episodes: int = RENDER_EPISODES):
     """
-    Render a trained PPO agent.
+    Render a trained PPO agent using stacked frames.
     """
     agent.load_models(checkpoint_dir)
 
     env = make_env(render=True, reward_mode=reward_mode)
     for ep in range(episodes):
         obs, info = env.reset()
-        state = preprocess_observation(obs)
+
+        frame_stack = FrameStack(n=FRAME_STACK)
+        state = frame_stack.reset(obs)
+
         done = False
         total_reward = 0.0
 
         while not done:
-            action, prob, val = agent.choose_action(state)
-            obs, reward, terminated, truncated, info = env.step(action)
-            state = preprocess_observation(obs)
+            env_action, prob, val, raw_action = agent.choose_action(state)
+            obs, reward, terminated, truncated, info = env.step(env_action)
+            state = frame_stack.step(obs)
             total_reward += reward
             done = terminated or truncated
 
@@ -777,7 +817,9 @@ def train_ppo_on_carracing(
 
     env = make_env(render=False, reward_mode=reward_mode, seed=seed)
     obs, info = env.reset(seed=seed)
-    state = preprocess_observation(obs)
+
+    frame_stack = FrameStack(n=FRAME_STACK)
+    state = frame_stack.reset(obs)
 
     agent = PPOAgent(
         n_actions=env.action_space.shape[0],
@@ -802,16 +844,16 @@ def train_ppo_on_carracing(
 
     for step in range(1, total_timesteps + 1):
         # Choose action from current PPO policy
-        action, prob, val = agent.choose_action(state)
+        env_action, prob, val, raw_action = agent.choose_action(state)
 
         # Step the environment
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        next_state = preprocess_observation(next_obs)
+        next_obs, reward, terminated, truncated, info = env.step(env_action)
+        next_state = frame_stack.step(next_obs)
 
         done = terminated or truncated
 
         # Store transition in PPO memory
-        agent.remember(state, prob, val, action, reward, done)
+        agent.remember(state, prob, val, raw_action, reward, done)
 
         state = next_state
         episode_reward += reward
@@ -824,7 +866,8 @@ def train_ppo_on_carracing(
         if done:
             print(f"[PPO] Episode {episode_num} | Step {step} | Reward: {episode_reward:.2f}")
             obs, info = env.reset()
-            state = preprocess_observation(obs)
+            frame_stack = FrameStack(n=FRAME_STACK)
+            state = frame_stack.reset(obs)
             episode_reward = 0.0
             episode_num += 1
 
