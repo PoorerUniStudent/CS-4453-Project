@@ -793,7 +793,7 @@ def train_ppo_on_carracing(
 
     print(f"[PPO] Starting training for {total_timesteps} steps...")
     print(f"[PPO] Device: {DEVICE} | Reward Mode: {reward_mode}")
-    print(f"[PPO] Discrete action space size: {env.action_space.n}")
+    print(f"[PPO] Continuous action space size: {env.action_space.shape[0]}")
     print(f"[PPO] Input dims: {get_input_dims_from_env()}")
 
     start_time = time.time()
