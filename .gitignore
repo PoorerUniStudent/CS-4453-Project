@@ -13,4 +13,4 @@ __pycache__/
 # Notebooks
 .ipynb_checkpoints/
 
-ppo_results\
+ppo_results/
