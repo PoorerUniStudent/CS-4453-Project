@@ -19,8 +19,8 @@ Important:
 Notes:
   - CarRacing observations are RGB images of shape (96, 96, 3).
   - Since the original PPO agent uses an MLP, we preprocess each
-    frame into grayscale, downsample it, flatten it, and feed the
-    resulting vector into the agent.
+    frame into grayscale, flatten it, and feed the resulting vector
+    into the agent.
   - This is not as strong as a CNN-based PPO, but it matches your
     current network architecture without changing the original core code.
 """
@@ -52,7 +52,6 @@ NUM_EVAL_EPISODES  = 5          # Number of evaluation episodes
 SEED               = 42         # Random seed
 
 # Observation preprocessing
-DOWNSAMPLED_SIZE   = 48         # 96x96 -> 48x48 via stride slicing
 NORMALIZE_OBS      = True       # Normalize grayscale pixels to [0, 1]
 
 # Output / checkpointing
@@ -92,20 +91,17 @@ def set_seed(seed: int):
 # Observation Preprocessing
 # ──────────────────────────────────────────────
 def preprocess_observation(obs: np.ndarray,
-                           downsample_size: int = DOWNSAMPLED_SIZE,
                            normalize: bool = NORMALIZE_OBS) -> np.ndarray:
     """
     Convert CarRacing RGB observation into a flattened grayscale vector.
 
     Steps:
       1. RGB -> grayscale
-      2. Downsample from 96x96 to 48x48 (default)
-      3. Normalize to [0, 1] if requested
-      4. Flatten into shape (downsample_size * downsample_size,)
+      2. Normalize to [0, 1] if requested
+      3. Flatten into shape (96 * 96,)
 
     Args:
         obs: Raw CarRacing observation, shape (96, 96, 3)
-        downsample_size: Final width/height after downsampling
         normalize: Whether to scale pixel values to [0, 1]
 
     Returns:
@@ -113,15 +109,6 @@ def preprocess_observation(obs: np.ndarray,
     """
     # Convert RGB to grayscale using standard luminance weights
     gray = np.dot(obs[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
-
-    # CarRacing frames are 96x96. To avoid changing your MLP architecture,
-    # we downsample by simple stride slicing.
-    if gray.shape[0] != downsample_size or gray.shape[1] != downsample_size:
-        stride = gray.shape[0] // downsample_size
-        gray = gray[::stride, ::stride]
-
-        # In case slicing gives a slightly larger shape, crop it
-        gray = gray[:downsample_size, :downsample_size]
 
     if normalize:
         gray /= 255.0
@@ -133,7 +120,7 @@ def get_input_dims_from_env() -> tuple:
     """
     Returns the flattened observation shape expected by the PPO networks.
     """
-    return (DOWNSAMPLED_SIZE * DOWNSAMPLED_SIZE,)
+    return (96 * 96,)
 
 
 # ──────────────────────────────────────────────
@@ -193,11 +180,11 @@ def make_env(render: bool = False, reward_mode: str = "default", seed: int = SEE
     Create a discrete CarRacing-v3 environment.
 
     Important:
-      continuous=False gives a discrete action space, which matches your PPO
+      continuous=True gives a discrete action space, which matches your PPO
       implementation based on Categorical action sampling.
     """
     render_mode = "human" if render else None
-    env = gym.make("CarRacing-v3", continuous=False, render_mode=render_mode)
+    env = gym.make("CarRacing-v3", continuous=True, render_mode=render_mode)
     env = RewardWrapper(env, mode=reward_mode)
     return env
 
