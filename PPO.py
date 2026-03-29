@@ -36,7 +36,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 
-
 # ──────────────────────────────────────────────
 # Hyperparameters
 # ──────────────────────────────────────────────
@@ -571,21 +570,24 @@ class PPOAgent:
         """
         self.memory.store_memory(state, prob, val, action, reward, done)
         
-    def save_models(self, checkpoint_dir='tmp/ppo'):
+    def save_models(self, filepath):
         """
-        Saves both actor and critic parameters.
+        Saves both actor and critic parameters into one .pt checkpoint file.
         """
         print('... saving models ...')
-        self.actor.save_checkpoint(checkpoint_dir)
-        self.critic.save_checkpoint(checkpoint_dir)
+        T.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict()
+        }, filepath)
         
-    def load_models(self, checkpoint_dir='tmp/ppo'):
+    def load_models(self, filepath):
         """
-        Loads both actor and critic parameters.
+        Loads both actor and critic parameters from one .pt checkpoint file.
         """
         print('... loading models ...')
-        self.actor.load_checkpoint(checkpoint_dir)
-        self.critic.load_checkpoint(checkpoint_dir)
+        checkpoint = T.load(filepath, map_location=self.actor.device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
         
     def choose_action(self, observation):
         """
@@ -915,7 +917,7 @@ def train_ppo_on_carracing(
 
         # Periodic checkpoint
         if step % CHECKPOINT_EVERY == 0:
-            checkpoint_dir = os.path.join(save_dir, f"checkpoint_{step}")
+            checkpoint_dir = os.path.join(save_dir, f"ppo_car_{step}.pt")
             os.makedirs(checkpoint_dir, exist_ok=True)
             agent.save_models(checkpoint_dir)
 
