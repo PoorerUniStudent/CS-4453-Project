@@ -34,7 +34,7 @@ import numpy as np
 import torch as T
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 
 # ──────────────────────────────────────────────
 # Hyperparameters
@@ -311,99 +311,49 @@ class PPOMemory:
 # ──────────────────────────────────────────────
 class ActorNetwork(nn.Module):
     """
-    Policy network for PPO.
+    Continuous-action policy network for PPO.
 
-    This network takes a state as input and outputs a probability distribution
-    over discrete actions.
+    Outputs a Gaussian policy:
+      - mean for each action dimension
+      - learnable log standard deviation
 
-    Architecture:
-        state -> Linear -> ReLU -> Linear -> ReLU -> Linear -> Softmax
-
-    Since Softmax is used, this actor is for DISCRETE action spaces only.
+    Designed for Box action spaces like CarRacing-v3 with continuous=True.
     """
     def __init__(self, n_actions, input_dims, alpha, fc1_dims=256, fc2_dims=256):
-        """
-        Args:
-            n_actions (int): number of discrete actions available in the environment.
-                             Must be >= 2 for most tasks.
-            input_dims (tuple): shape of state input, e.g. (8,) or (4,)
-            alpha (float): learning rate for Adam optimizer.
-                           Common PPO range: 1e-5 to 3e-4
-            fc1_dims (int): number of neurons in first hidden layer.
-                            Common range: 64 to 512
-            fc2_dims (int): number of neurons in second hidden layer.
-                            Common range: 64 to 512
-        """
         super(ActorNetwork, self).__init__()
-        
-        # File path where actor model parameters will be saved
-        self.checkpoint_file = os.path.join('tmp/ppo', 'actor_torch_ppo')
 
-        # Sequential actor network:
-        # 1) input -> hidden layer
-        # 2) ReLU activation
-        # 3) hidden -> hidden
-        # 4) ReLU activation
-        # 5) hidden -> output logits
-        # 6) Softmax converts logits to action probabilities summing to 1
+        input_dim = input_dims[0] if isinstance(input_dims, tuple) else input_dims
+
+        # Shared feature extractor
         self.actor = nn.Sequential(
-            nn.Linear(*input_dims, fc1_dims),  # input_dims is unpacked, e.g. (8,) -> 8
+            nn.Linear(input_dim, fc1_dims),
             nn.ReLU(),
             nn.Linear(fc1_dims, fc2_dims),
             nn.ReLU(),
-            nn.Linear(fc2_dims, n_actions),
-            nn.Softmax(dim=-1)
         )
-        
-        # Adam optimizer updates actor parameters using computed gradients
+
+        # Mean output for each action dimension
+        self.mu = nn.Linear(fc2_dims, n_actions)
+
+        # Learnable log standard deviation for each action dimension
+        self.log_std = nn.Parameter(T.zeros(n_actions))
+
         self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-
-        # Use GPU if available, else CPU
         self.device = DEVICE
-
-        # Move model to chosen device
         self.to(self.device)
 
     def forward(self, state):
         """
-        Runs a forward pass through the actor network.
-
-        Args:
-            state (Tensor): tensor of states, shape usually [batch_size, state_dim]
-
-        Returns:
-            dist (Categorical): categorical action distribution
-
-        Notes:
-            - self.actor(state) produces probabilities for each action.
-            - Categorical(dist) wraps those probabilities into a distribution object.
-            - Later we can sample actions and compute log-probabilities from it.
+        Returns a Normal distribution over continuous actions.
         """
-        dist = self.actor(state)   # Action probabilities
-        dist = Categorical(dist)   # Convert probabilities into a distribution
-        
+        x = self.actor(state)
+        mu = self.mu(x)
+
+        # Expand log_std to match batch dimension
+        std = T.exp(self.log_std).expand_as(mu)
+
+        dist = Normal(mu, std)
         return dist
-    
-    def save_checkpoint(self, checkpoint_dir='tmp/ppo'):
-        """
-        Saves actor network weights to disk.
-
-        Args:
-            checkpoint_dir (str): directory where checkpoint will be saved.
-        """
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        save_path = os.path.join(checkpoint_dir, 'actor_torch_ppo')
-        T.save(self.state_dict(), save_path)
-        
-    def load_checkpoint(self, checkpoint_dir='tmp/ppo'):
-        """
-        Loads actor network weights from disk.
-
-        Args:
-            checkpoint_dir (str): directory where checkpoint was saved.
-        """
-        load_path = os.path.join(checkpoint_dir, 'actor_torch_ppo')
-        self.load_state_dict(T.load(load_path, map_location=self.device))
         
         
 # ──────────────────────────────────────────────
@@ -579,37 +529,29 @@ class PPOAgent:
         
     def choose_action(self, observation):
         """
-        Selects an action using the current policy.
-
-        Steps:
-            1) Convert observation to tensor
-            2) Get action distribution from actor
-            3) Get state-value estimate from critic
-            4) Sample an action from the distribution
-            5) Return action, its log-probability, and value estimate
-
-        Args:
-            observation: environment state, usually a NumPy array
-
-        Returns:
-            action (int): chosen discrete action
-            probs (float): log-probability of chosen action
-            value (float): critic estimate V(s)
-
-        Notes:
-            - state is wrapped in [observation] so it becomes a batch of size 1
-            - T.squeeze removes extra dimensions
+        Select a continuous action using the current Gaussian policy.
         """
         state = T.tensor([observation], dtype=T.float).to(self.actor.device)
-        
-        dist = self.actor(state)      # Policy distribution over actions
-        value = self.critic(state)    # Estimated value of current state
-        action = dist.sample()        # Sample one action
-        
-        probs = T.squeeze(dist.log_prob(action)).item()  # log pi(a|s)
-        action = T.squeeze(action).item()                # convert action tensor -> Python int
-        value = T.squeeze(value).item()                  # convert value tensor -> Python float
-        
+
+        dist = self.actor(state)
+        value = self.critic(state)
+
+        action = dist.sample()
+
+        # Sum log-probs across action dimensions
+        probs = T.sum(dist.log_prob(action), dim=-1).item()
+
+        action = T.squeeze(action).cpu().numpy()
+        value = T.squeeze(value).item()
+
+        # CarRacing continuous actions:
+        # steering in [-1, 1]
+        # gas in [0, 1]
+        # brake in [0, 1]
+        action[0] = np.clip(action[0], -1.0, 1.0)
+        action[1] = np.clip(action[1],  0.0, 1.0)
+        action[2] = np.clip(action[2],  0.0, 1.0)
+
         return action, probs, value
         
     def learn(self):
@@ -681,7 +623,7 @@ class PPOAgent:
                 # Extract batch data and convert to tensors
                 states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
                 old_probs = T.tensor(old_prob_arr[batch]).to(self.actor.device)
-                actions = T.tensor(action_arr[batch]).to(self.actor.device)
+                actions = T.tensor(action_arr[batch], dtype=T.float).to(self.actor.device)
                 
                 # Forward pass through actor and critic with CURRENT parameters
                 dist = self.actor(states)
@@ -690,7 +632,7 @@ class PPOAgent:
                 critic_value = critic_value.squeeze()  # shape [batch_size]
                 
                 # New log-probabilities of the same actions under updated policy
-                new_probs = dist.log_prob(actions)
+                new_probs = dist.log_prob(actions).sum(dim=-1)
 
                 # Probability ratio:
                 # ratio = exp(new_log_prob) / exp(old_log_prob)
@@ -838,7 +780,7 @@ def train_ppo_on_carracing(
     state = preprocess_observation(obs)
 
     agent = PPOAgent(
-        n_actions=env.action_space.n,
+        n_actions=env.action_space.shape[0],
         input_dims=get_input_dims_from_env(),
         alpha=alpha,
         gamma=gamma,
@@ -972,7 +914,7 @@ if __name__ == "__main__":
             # Create a dummy env just to get action space size
             dummy_env = make_env(render=False, reward_mode=args.reward_mode, seed=args.seed)
             agent = PPOAgent(
-                n_actions=dummy_env.action_space.n,
+                n_actions=dummy_env.action_space.shape[0],
                 input_dims=get_input_dims_from_env(),
                 alpha=args.alpha,
                 gamma=args.gamma,
