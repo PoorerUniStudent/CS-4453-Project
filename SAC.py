@@ -140,12 +140,36 @@ class RewardWrapper(gym.Wrapper):
             return reward
         elif self.mode == "clip":
             return float(np.clip(reward, -1.0, 1.0))
-        elif self.mode == "speed":
+        elif self.mode == "oldspeed": # first speed run reward
             # Car's true speed is rendered in the observation but not
             # directly exposed; we approximate via reward delta as a proxy.
             speed_bonus = 0.01 * max(reward - self._prev_reward, 0)
             self._prev_reward = reward
             return reward + speed_bonus
+        elif self.mode == "speed":
+            # Small bonus for velocity magnitude
+            vel = self.env.unwrapped.car.hull.linearVelocity
+            speed = np.sqrt(np.sum(np.square(vel)))
+            return reward + 0.1 * speed
+        elif self.mode == "precision":
+            # 1. Base reward
+            # 2. Speed bonus (forward only)
+            # 3. Spinning penalty (angular velocity)
+            # 4. Backward sliding penalty
+            car = self.env.unwrapped.car
+            vx, vy = car.hull.linearVelocity
+            angle = car.hull.angle
+            
+            # Unit vector of the car's nose (Box2D CarRacing specific)
+            unit_x, unit_y = -np.sin(angle), np.cos(angle)
+            forward_speed = vx * unit_x + vy * unit_y
+            
+            # Bonuses and Penalties
+            speed_bonus = 0.1 * max(forward_speed, 0)
+            spin_penalty = 0.5 * abs(car.hull.angularVelocity)
+            backward_penalty = 5.0 if forward_speed < -1.0 else 0.0
+            
+            return reward + speed_bonus - spin_penalty - backward_penalty
         elif self.mode == "custom":
             return self._custom_reward(reward, obs, terminated, truncated, info)
         else:
@@ -332,9 +356,11 @@ class SACAgent:
     Manages the actor, twin critics, target networks, and automatic entropy tuning.
     """
 
-    def __init__(self, action_dim: int = 3, feature_dim: int = 512, lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005):
+    def __init__(self, action_dim: int = 3, feature_dim: int = 512, lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005, min_alpha: float = None, alpha_lr: float = 3e-4):
         self.gamma = gamma
         self.tau = tau
+        self.alpha_lr = alpha_lr
+        self.min_log_alpha = np.log(min_alpha) if min_alpha is not None else None
 
         # Networks
         self.feature_extractor = CNNFeatureExtractor(FRAME_STACK, feature_dim).to(DEVICE)
@@ -357,8 +383,10 @@ class SACAgent:
 
         # Automatic Entropy Tuning
         self.target_entropy = -action_dim
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=DEVICE)
-        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
+        # Initial log_alpha (using -1.6 for exp(-1.6) ~= 0.2 initial alpha)
+        # Note: Must be a leaf tensor for the optimizer
+        self.log_alpha = torch.tensor([-1.6], requires_grad=True, device=DEVICE)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=self.alpha_lr)
 
     @property
     def alpha(self):
@@ -426,6 +454,11 @@ class SACAgent:
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
+        # Clamp log_alpha if a minimum is provided
+        if self.min_log_alpha is not None:
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=self.min_log_alpha)
+
         # 4. Soft Update Target Networks
         for param, target_param in zip(self.critic1.parameters(), self.target_critic1.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
@@ -439,17 +472,32 @@ class SACAgent:
             "alpha": self.alpha.item()
         }
 
+    def set_lr(self, lr: float):
+        """Manually update the learning rate for all optimizers."""
+        for opt in [self.actor_optimizer, self.critic_optimizer, self.alpha_optimizer]:
+            for param_group in opt.param_groups:
+                param_group['lr'] = lr
+
+    def toggle_feature_extractor(self, enabled: bool):
+        """Enable or disable gradients for the shared CNN feature extractor."""
+        for param in self.feature_extractor.parameters():
+            param.requires_grad = enabled
+
     def save(self, path: str):
-        """Save network weights."""
+        """Save network weights, optimizers, and alpha."""
         torch.save({
             "feature_extractor": self.feature_extractor.state_dict(),
             "actor": self.actor.state_dict(),
             "critic1": self.critic1.state_dict(),
             "critic2": self.critic2.state_dict(),
+            "log_alpha": self.log_alpha,
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "alpha_optimizer": self.alpha_optimizer.state_dict(),
         }, path)
 
     def load(self, path: str):
-        """Load network weights."""
+        """Load network weights and optimizer states."""
         ckpt = torch.load(path, map_location=DEVICE)
         self.feature_extractor.load_state_dict(ckpt["feature_extractor"])
         self.actor.load_state_dict(ckpt["actor"])
@@ -457,6 +505,16 @@ class SACAgent:
         self.critic2.load_state_dict(ckpt["critic2"])
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
+
+        # Load alpha and optimizers if they exist in the checkpoint
+        if "log_alpha" in ckpt:
+            self.log_alpha.data.copy_(ckpt["log_alpha"].data)
+        if "actor_optimizer" in ckpt:
+            self.actor_optimizer.load_state_dict(ckpt["actor_optimizer"])
+        if "critic_optimizer" in ckpt:
+            self.critic_optimizer.load_state_dict(ckpt["critic_optimizer"])
+        if "alpha_optimizer" in ckpt:
+            self.alpha_optimizer.load_state_dict(ckpt["alpha_optimizer"])
 
 
 # ──────────────────────────────────────────────
@@ -527,13 +585,22 @@ def parse_args():
         "--reward-mode",
         type=str,
         default="default",
-        choices=["default", "clip", "speed", "custom"],
+        choices=["default", "clip", "speed", "precision", "custom"],
         help="Reward wrapper mode for experimentation.",
     )
 
-    # Evaluation / rendering
-    parser.add_argument("--render", action="store_true", help="Render a trained agent.")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt checkpoint.")
+    # Evaluation / rendering / resume
+    parser.add_argument("--render", action="store_true", help="Render a trained agent using --checkpoint.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt for --render mode.")
+    parser.add_argument("--load-checkpoint", type=str, default=None, help="Path to .pt to resume training from.")
+    parser.add_argument("--start-step", type=int, default=0, help="Initial step count (to match loaded checkpoint).")
+    parser.add_argument("--refill-steps", type=int, default=1000, help="Number of random steps to refill buffer when resuming.")
+    parser.add_argument("--alpha-init", type=float, default=None, help="Initial alpha (overrides default or checkpoint).")
+    parser.add_argument("--resume-lr", type=float, default=None, help="Starting LR for resume (stable fallback).")
+    parser.add_argument("--warmup-steps", type=int, default=50000, help="Steps to linearly increase LR back to original.")
+    parser.add_argument("--freeze-cnn-until", type=int, default=None, help="Step count until which the CNN remains frozen.")
+    parser.add_argument("--min-alpha", type=float, default=None, help="Minimum alpha floor to prevent entropy collapse.")
+    parser.add_argument("--alpha-lr", type=float, default=3e-4, help="Learning rate for entropy temperature tuning.")
 
     # Output
     parser.add_argument("--save-dir", type=str, default="sac_results",
@@ -569,7 +636,9 @@ if __name__ == "__main__":
         feature_dim=512,
         lr=args.lr,
         gamma=args.gamma,
-        tau=args.tau
+        tau=args.tau,
+        min_alpha=args.min_alpha,
+        alpha_lr=args.alpha_lr
     )
 
     # Handle Rendering / Evaluation Mode
@@ -598,16 +667,49 @@ if __name__ == "__main__":
 
     buffer = ReplayBuffer(args.buffer_size, stacked.shape, env.action_space.shape[0])
 
-    print(f"[SAC] Starting training for {args.total_timesteps} steps...")
+    if args.load_checkpoint:
+        # Load weights for actor/critic to continue training from a saved state
+        print(f"[SAC] Loading checkpoint from {args.load_checkpoint} to resume training...")
+        agent.load(args.load_checkpoint)
+
+    # Allow overriding alpha if provided in CLI (useful for fixing old checkpoints)
+    if args.alpha_init is not None:
+        print(f"[SAC] Overriding Alpha to {args.alpha_init}")
+        with torch.no_grad():
+            agent.log_alpha.data.fill_(np.log(args.alpha_init))
+
+    print(f"[SAC] Starting training for {args.total_timesteps} steps (from step {args.start_step})...")
     print(f"[SAC] Device: {DEVICE} | Reward Mode: {args.reward_mode}")
 
     start_time = time.time()
     ep_reward = 0
     ep_length = 0
 
-    for t in range(1, args.total_timesteps + 1):
+    target_lr = args.lr
+    current_lr = target_lr
+
+    # Use start_step as the initial value for the counter
+    for t in range(args.start_step + 1, args.total_timesteps + 1):
+        # 0a. CNN Freezing (Vision Protection)
+        if args.freeze_cnn_until is not None:
+            if t <= args.freeze_cnn_until:
+                agent.toggle_feature_extractor(False)
+            else:
+                agent.toggle_feature_extractor(True)
+
+        # 0b. Learning Rate Warmup/Recovery
+        # If we are in the warmup phase after a resume, adjust the LR
+        if args.resume_lr is not None and t > args.start_step + args.refill_steps:
+            relative_step = t - (args.start_step + args.refill_steps)
+            progress = min(1.0, relative_step / args.warmup_steps)
+            new_lr = args.resume_lr + progress * (target_lr - args.resume_lr)
+            if new_lr != current_lr:
+                agent.set_lr(new_lr)
+                current_lr = new_lr
+
         # 1. Action selection
-        if t < args.learning_starts:
+        # If we are starting from scratch OR we just resumed and the buffer is still refilling
+        if t < args.learning_starts or buffer.size < args.refill_steps:
             action = env.action_space.sample()
         else:
             action = agent.select_action(stacked)
@@ -625,7 +727,8 @@ if __name__ == "__main__":
 
         # 4. Update iteration
         metrics = None
-        if t >= args.learning_starts:
+        # Only start training if we are past learning_starts AND the buffer has refilled
+        if t >= args.learning_starts and buffer.size >= args.refill_steps and buffer.size >= args.batch_size:
             metrics = agent.update(buffer, args.batch_size)
 
         # 5. Handle episode end
@@ -638,7 +741,9 @@ if __name__ == "__main__":
         # 6. Evaluation and Logging
         if t % args.eval_every == 0:
             avg_reward = evaluate(agent, args.reward_mode, seed=args.seed)
-            fps = int(t / (time.time() - start_time))
+            # Use relative time and steps for FPS calculation
+            elapsed = time.time() - start_time
+            fps = int((t - args.start_step) / elapsed) if elapsed > 0 else 0
 
             print(f"[{t}/{args.total_timesteps}] "
                   f"Eval Reward: {avg_reward:.2f} | "

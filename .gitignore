@@ -12,3 +12,15 @@ __pycache__/
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Training Outputs
+sac_full_run/
+sac_speed_run/
+sac_results/
+test_run/
+final_pro_drive/
+CHAMPION_*.pt
+
+.vscode
+pyrightconfig.json
+CHANGELOG.md
