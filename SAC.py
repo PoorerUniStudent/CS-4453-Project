@@ -132,8 +132,10 @@ class RewardWrapper(gym.Wrapper):
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
-        reward = self._shape_reward(reward, obs, terminated, truncated, info)
-        return obs, reward, terminated, truncated, info
+        # Store raw reward in info for later analysis
+        info['raw_reward'] = float(reward)
+        shaped_reward = self._shape_reward(reward, obs, terminated, truncated, info)
+        return obs, float(shaped_reward), terminated, truncated, info
 
     def _shape_reward(self, reward, obs, terminated, truncated, info):
         if self.mode == "default":
@@ -548,28 +550,32 @@ def make_env(render: bool = False, reward_mode: str = "default", seed: int = SEE
 
 
 def evaluate(agent: SACAgent, reward_mode: str, num_episodes: int = NUM_EVAL_EPS, seed: int = SEED):
-    """Run `num_episodes` using the deterministic policy and return the mean reward."""
+    """Run `num_episodes` using the deterministic policy and return (mean_shaped, mean_raw)."""
     eval_env = make_env(render=False, reward_mode=reward_mode, seed=seed + 100)
-    total_reward = 0.0
+    total_reward_shaped = 0.0
+    total_reward_raw = 0.0
 
-    for _ in range(num_episodes):
-        obs, info = eval_env.reset()
+    for i in range(num_episodes):
+        obs, info = eval_env.reset(seed=seed + i)
         frame_stack = FrameStack(n=FRAME_STACK)
         stacked = frame_stack.reset(obs)
         done = False
-        ep_reward = 0.0
+        ep_reward_shaped = 0.0
+        ep_reward_raw = 0.0
 
         while not done:
             action = agent.select_action(stacked, deterministic=True)
-            obs, reward, terminated, truncated, _ = eval_env.step(action)
+            obs, reward, terminated, truncated, info = eval_env.step(action)
             stacked = frame_stack.step(obs)
-            ep_reward += reward
+            ep_reward_shaped += reward
+            ep_reward_raw += info.get('raw_reward', reward)
             done = terminated or truncated
 
-        total_reward += ep_reward
+        total_reward_shaped += ep_reward_shaped
+        total_reward_raw += ep_reward_raw
 
     eval_env.close()
-    return total_reward / num_episodes
+    return total_reward_shaped / num_episodes, total_reward_raw / num_episodes
 
 
 # ──────────────────────────────────────────────
@@ -631,7 +637,7 @@ if __name__ == "__main__":
 
     if not os.path.exists(log_file):
         with open(log_file, "w") as f:
-            f.write("step,reward,critic_loss,actor_loss,alpha\n")
+            f.write("step,reward_shaped,reward_raw,critic_loss,actor_loss,alpha\n")
 
     # Initialize environment and components
     env = make_env(render=False, reward_mode=args.reward_mode, seed=args.seed)
@@ -656,21 +662,24 @@ if __name__ == "__main__":
             print("[SAC] Error: Must provide --checkpoint to render.")
         else:
             print(f"[SAC] Rendering agent from {args.checkpoint}...")
+            print(f"[SAC] Using Reward Mode: {args.reward_mode}")
             agent.load(args.checkpoint)
             eval_env = make_env(render=True, reward_mode=args.reward_mode)
             for ep in range(5):
-                obs, _ = eval_env.reset()
+                obs, _ = eval_env.reset(seed=args.seed + ep)
                 fs = FrameStack(n=FRAME_STACK)
                 stk = fs.reset(obs)
                 done = False
-                total_r = 0
+                total_r_shaped = 0
+                total_r_raw = 0
                 while not done:
                     act = agent.select_action(stk, deterministic=True)
-                    obs, r, term, trunc, _ = eval_env.step(act)
+                    obs, r, term, trunc, info = eval_env.step(act)
                     stk = fs.step(obs)
-                    total_r += r
+                    total_r_shaped += r
+                    total_r_raw += info.get('raw_reward', r)
                     done = term or trunc
-                print(f"Episode {ep+1}: Reward = {total_r:.2f}")
+                print(f"Episode {ep+1}: Shaped Reward = {total_r_shaped:.2f} | Raw Reward = {total_r_raw:.2f}")
             eval_env.close()
         exit()
 
@@ -749,13 +758,13 @@ if __name__ == "__main__":
 
         # 6. Evaluation and Logging
         if t % args.eval_every == 0:
-            avg_reward = evaluate(agent, args.reward_mode, seed=args.seed)
+            avg_reward_shaped, avg_reward_raw = evaluate(agent, args.reward_mode, seed=args.seed)
             # Use relative time and steps for FPS calculation
             elapsed = time.time() - start_time
             fps = int((t - args.start_step) / elapsed) if elapsed > 0 else 0
 
             print(f"[{t}/{args.total_timesteps}] "
-                  f"Eval Reward: {avg_reward:.2f} | "
+                  f"Eval Shaped: {avg_reward_shaped:.2f} | Raw: {avg_reward_raw:.2f} | "
                   f"FPS: {fps} | "
                   f"Alpha: {metrics['alpha']:.4f}" if metrics else "")
 
@@ -764,7 +773,7 @@ if __name__ == "__main__":
                 c_loss = metrics['critic_loss'] if metrics else 0
                 a_loss = metrics['actor_loss'] if metrics else 0
                 alpha = metrics['alpha'] if metrics else 0
-                f.write(f"{t},{avg_reward},{c_loss},{a_loss},{alpha}\n")
+                f.write(f"{t},{avg_reward_shaped},{avg_reward_raw},{c_loss},{a_loss},{alpha}\n")
 
             # Save checkpoint
             checkpoint_path = os.path.join(args.save_dir, f"sac_car_{t}.pt")
