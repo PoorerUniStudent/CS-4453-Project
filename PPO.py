@@ -924,7 +924,7 @@ def parse_args():
         "--reward-mode",
         type=str,
         default="default",
-        choices=["default", "clip"],
+        choices=["default", "clip", "oldspeed", "speed", "precision", "custom"],
         help="Reward wrapper mode."
     )
 
