@@ -29,5 +29,5 @@ CHANGELOG.md
 
 
 
-
-ppo_results/
+ppo_results_v1/ppo_carracing_*.pt
+ppo_results_v2/ppo_carracing_*.pt

@@ -1,750 +1,582 @@
 """
-Proximal Policy Optimization (PPO) for Gymnasium CarRacing-v3
-=============================================================
-A PyTorch PPO implementation adapted to run on Gymnasium's
-CarRacing-v3 environment using a DISCRETE action space.
+PPO for Gymnasium CarRacing-v3 (single-file, runnable)
+======================================================
 
-This file keeps the original PPO agent implementation intact,
-and adds:
-  - top-level configurable hyperparameters
-  - CarRacing observation preprocessing
-  - environment factory
-  - training / evaluation / rendering helpers
-  - CLI argument parsing
+This script implements Proximal Policy Optimization (PPO) for CarRacing-v3
+using a discrete action space and includes command-line run settings for:
+
+- training from scratch
+- resuming training from checkpoints
+- evaluation / rendering
+- CSV logging every N steps
+- checkpoint saving on a fixed interval
 
 Important:
-  Your PPO actor uses a Categorical distribution, so this setup
-  uses CarRacing-v3 with continuous=False.
+This version only keeps CLI arguments that also exist in the SAC.py file you sent,
+and only uses the ones that are actually needed for this PPO script. The PPO
+learning logic itself is unchanged unless necessary for checkpoint/logging support.
 
-Notes:
-  - CarRacing observations are RGB images of shape (96, 96, 3).
-  - Since the original PPO agent uses an MLP, we preprocess each
-    frame into grayscale, flatten it, and feed the resulting vector
-    into the agent.
-  - This is not as strong as a CNN-based PPO, but it matches your
-    current network architecture without changing the original core code.
+Reference workflow adapted from your SAC.py file: :contentReference[oaicite:0]{index=0}
 """
 
-import argparse
-import os
-import time
+from __future__ import annotations
 
+import argparse
+import collections
+import csv
+import os
+import random
+import time
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Tuple
+
+import cv2
 import gymnasium as gym
 import numpy as np
-import torch as T
+import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.distributions.normal import Normal
-from collections import deque
-
-# ──────────────────────────────────────────────
-# Hyperparameters
-# ──────────────────────────────────────────────
-LEARNING_RATE      = 5e-5       # Adam learning rate
-GAMMA              = 0.99       # Discount factor
-GAE_LAMBDA         = 0.95       # GAE lambda
-POLICY_CLIP        = 0.2        # PPO clipping epsilon
-BATCH_SIZE         = 64         # Mini-batch size
-ROLLOUT_STEPS      = 4096       # Number of env steps before each PPO update
-N_EPOCHS           = 10         # PPO training epochs per rollout
-TOTAL_TIMESTEPS    = 300_000    # Total training steps
-EVAL_EVERY         = 10_000     # Evaluate every N steps
-NUM_EVAL_EPISODES  = 5          # Number of evaluation episodes
-SEED               = 42         # Random seed
-
-# Observation preprocessing
-NORMALIZE_OBS      = True       # Normalize grayscale pixels to [0, 1]
-FRAME_STACK        = 4          # Number of consecutive grayscale frames to stack
-
-# Output / checkpointing
-SAVE_DIR           = "ppo_results"
-
-# Rendering
-RENDER_EPISODES    = 5
+from torch.distributions import Categorical
 
 
-# ──────────────────────────────────────────────
-# CUDA / MPS / CPU Device Selection
-# ──────────────────────────────────────────────
-if T.cuda.is_available():
-    DEVICE = T.device("cuda")
-elif hasattr(T.backends, "mps") and T.backends.mps.is_available():
-    DEVICE = T.device("mps")
+# ============================================================
+# Default Hyperparameters
+# ============================================================
+
+TOTAL_TIMESTEPS = 1_000_000
+ROLLOUT_STEPS = 2048
+EPOCHS = 10
+MINIBATCH_SIZE = 256
+LEARNING_RATE = 2.5e-4
+ADAM_EPS = 1e-5
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
+CLIP_COEF = 0.2
+ENT_COEF = 0.01
+VF_COEF = 0.5
+MAX_GRAD_NORM = 0.5
+TARGET_KL = 0.03
+
+FRAME_STACK = 4
+WIDTH = 84
+HEIGHT = 84
+CROP_TOP = 0
+CROP_BOTTOM = 12
+REWARD_CLIP = 1.0
+GRASS_TIMEOUT = 100
+
+SEED = 42
+EVAL_EVERY = 10_000
+NUM_EVAL_EPS = 5
+
+
+# ============================================================
+# Device Selection
+# ============================================================
+
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
 else:
-    DEVICE = T.device("cpu")
+    DEVICE = torch.device("cpu")
 
 print(f"[PPO] Using device: {DEVICE}")
 
 
-# ──────────────────────────────────────────────
-# Seeding
-# ──────────────────────────────────────────────
-def set_seed(seed: int):
-    """
-    Set random seeds for reproducibility.
-    """
+# ============================================================
+# Utilities
+# ============================================================
+
+def set_seed(seed: int) -> None:
+    """Set seeds for reproducibility."""
+    random.seed(seed)
     np.random.seed(seed)
-    T.manual_seed(seed)
-    if T.cuda.is_available():
-        T.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-# ──────────────────────────────────────────────
-# Observation Preprocessing
-# ──────────────────────────────────────────────
-def preprocess_observation(obs: np.ndarray,
-                           normalize: bool = NORMALIZE_OBS) -> np.ndarray:
+def ensure_dir(path: str) -> None:
+    """Create directory if it does not exist."""
+    os.makedirs(path, exist_ok=True)
+
+
+def maybe_init_csv(csv_path: str) -> None:
+    """Create CSV file with header if it does not already exist."""
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "step",
+                "eval_reward",
+                "policy_loss",
+                "value_loss",
+                "entropy",
+                "approx_kl",
+                "clipfrac",
+                "lr",
+            ])
+
+
+def append_csv_row(csv_path: str, row: List[object]) -> None:
+    """Append one row to the CSV log."""
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(row)
+
+
+# ============================================================
+# Discrete action wrapper
+# ============================================================
+
+class DiscreteCarRacingWrapper(gym.ActionWrapper):
     """
-    Convert one CarRacing RGB observation into one grayscale frame.
+    Converts CarRacing continuous controls [steer, gas, brake]
+    into a discrete action space.
 
-    Steps:
-      1. RGB -> grayscale
-      2. Normalize to [0, 1] if requested
-
-    Args:
-        obs: Raw CarRacing observation, shape (96, 96, 3)
-        normalize: Whether to scale pixel values to [0, 1]
-
-    Returns:
-        2D float32 NumPy array of shape (96, 96).
-    """
-    gray = np.dot(obs[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
-
-    if normalize:
-        gray /= 255.0
-
-    return gray
-
-
-class FrameStack:
-    """
-    Maintains a stack of the last `n` grayscale frames.
-
-    Since the PPO agent uses an MLP, the stacked frames are flattened before
-    being passed into the network.
-    """
-    def __init__(self, n: int = FRAME_STACK):
-        self.n = n
-        self.frames = deque(maxlen=n)
-
-    def reset(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Reset the frame stack using the initial observation.
-        Fills the stack with the same first frame `n` times.
-        """
-        frame = preprocess_observation(obs)
-        self.frames.clear()
-        for _ in range(self.n):
-            self.frames.append(frame)
-        return self._get_stacked()
-
-    def step(self, obs: np.ndarray) -> np.ndarray:
-        """
-        Push a new frame and return the updated stacked observation.
-        """
-        frame = preprocess_observation(obs)
-        self.frames.append(frame)
-        return self._get_stacked()
-
-    def _get_stacked(self) -> np.ndarray:
-        """
-        Return stacked frames flattened into a 1D vector for the MLP.
-        Shape: (FRAME_STACK * 96 * 96,)
-        """
-        stacked = np.array(self.frames, dtype=np.float32)
-        return stacked.flatten()
-
-
-def get_input_dims_from_env() -> tuple:
-    """
-    Returns the flattened stacked observation shape expected by the PPO networks.
-    """
-    return (FRAME_STACK * 96 * 96,)
-
-
-# ──────────────────────────────────────────────
-# Reward Wrapper
-# ──────────────────────────────────────────────
-class RewardWrapper(gym.Wrapper):
-    """
-    Wraps CarRacing to allow experimenting with different reward signals.
-
-    Modes:
-      - "default"    : Use the environment's built-in reward unchanged.
-      - "clip"       : Clip rewards to [-1, +1] for training stability.
-      - "speed"      : Add a small bonus proportional to the car's speed,
-                       encouraging the agent to drive faster.
-      - "custom"     : Override `custom_reward()` for your own design.
-
-    Allows studying of reward shaping affects of driving behavior,
-    as described in the project proposal.
+    Action mapping:
+        0: do nothing
+        1: steer left
+        2: steer right
+        3: gas
+        4: brake
+        5: gas + left
+        6: gas + right
+        7: brake + left
+        8: brake + right
     """
 
-    def __init__(self, env: gym.Env, mode: str = "default"):
+    def __init__(self, env: gym.Env):
         super().__init__(env)
-        self.mode = mode
-        self._prev_reward = 0.0
+        self.action_space = gym.spaces.Discrete(9)
+
+        # v1:
+            # 0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            # 1: np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+            # 2: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            # 3: np.array([0.0, 0.6, 0.0], dtype=np.float32),
+            # 4: np.array([0.0, 0.0, 0.9], dtype=np.float32),
+            # 5: np.array([-0.6, 0.4, 0.0], dtype=np.float32),
+            # 6: np.array([0.6, 0.4, 0.0], dtype=np.float32),
+            # 7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
+            # 8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
+        
+        self._actions = {
+            0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            1: np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+            2: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            3: np.array([0.0, 0.4, 0.0], dtype=np.float32),
+            4: np.array([0.0, 0.0, 0.9], dtype=np.float32),
+            5: np.array([-0.6, 0.25, 0.0], dtype=np.float32),
+            6: np.array([0.6, 0.25, 0.0], dtype=np.float32),
+            7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
+            8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
+        }
+
+    def action(self, action: int) -> np.ndarray:
+        """Map discrete action index to continuous control vector."""
+        return self._actions[int(action)].copy()
+
+
+# ============================================================
+# Observation preprocessing
+# ============================================================
+
+class CarRacingPreprocess(gym.Wrapper):
+    """
+    Preprocess observations for CarRacing:
+    - crop bottom HUD
+    - grayscale
+    - resize
+    - stack consecutive frames
+    - optional reward clipping
+    - timeout if the car stays too long off-track
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        frame_stack: int = FRAME_STACK,
+        width: int = WIDTH,
+        height: int = HEIGHT,
+        crop_top: int = CROP_TOP,
+        crop_bottom: int = CROP_BOTTOM,
+        reward_clip: float | None = REWARD_CLIP,
+        grass_timeout: int = GRASS_TIMEOUT,
+    ):
+        super().__init__(env)
+        self.frame_stack = frame_stack
+        self.width = width
+        self.height = height
+        self.crop_top = crop_top
+        self.crop_bottom = crop_bottom
+        self.reward_clip = reward_clip
+        self.grass_timeout = grass_timeout
+
+        self.frames: Deque[np.ndarray] = collections.deque(maxlen=frame_stack)
+        self.offtrack_counter = 0
+
+        self.observation_space = gym.spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(frame_stack, height, width),
+            dtype=np.float32,
+        )
+
+    def _process(self, obs: np.ndarray) -> np.ndarray:
+        """Crop, grayscale, resize, and normalize a single RGB frame."""
+        if self.crop_bottom > 0:
+            obs = obs[self.crop_top: obs.shape[0] - self.crop_bottom, :, :]
+        else:
+            obs = obs[self.crop_top:, :, :]
+
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        processed = resized.astype(np.float32) / 255.0
+        return processed
+
+    @staticmethod
+    def _estimate_offtrack(frame: np.ndarray) -> bool:
+        """Lightweight off-track heuristic based on center patch brightness."""
+        h, w = frame.shape
+        center = frame[h // 2 - 8:h // 2 + 8, w // 2 - 8:w // 2 + 8]
+        mean_val = float(center.mean())
+        return mean_val < 0.35
+
+    def _get_stacked_obs(self) -> np.ndarray:
+        """Return the current stacked observation."""
+        while len(self.frames) < self.frame_stack:
+            self.frames.append(self.frames[-1].copy())
+        return np.stack(list(self.frames), axis=0).astype(np.float32)
+
+    def reset(self, **kwargs):
+        """Reset environment and initialize frame stack."""
+        obs, info = self.env.reset(**kwargs)
+        proc = self._process(obs)
+        self.frames.clear()
+        for _ in range(self.frame_stack):
+            self.frames.append(proc)
+        self.offtrack_counter = 0
+        return self._get_stacked_obs(), info
 
     def step(self, action):
+        """Step environment, preprocess, clip reward, and apply grass timeout."""
         obs, reward, terminated, truncated, info = self.env.step(action)
-        reward = self._shape_reward(reward, obs, terminated, truncated, info)
-        return obs, reward, terminated, truncated, info
+        proc = self._process(obs)
+        self.frames.append(proc)
 
-    def _shape_reward(self, reward, obs, terminated, truncated, info):
-        if self.mode == "default":
-            return reward
-        elif self.mode == "clip":
-            return float(np.clip(reward, -1.0, 1.0))
-        elif self.mode == "oldspeed": # first speed run reward
-            # Car's true speed is rendered in the observation but not
-            # directly exposed; we approximate via reward delta as a proxy.
-            speed_bonus = 0.01 * max(reward - self._prev_reward, 0)
-            self._prev_reward = reward
-            return reward + speed_bonus
-        elif self.mode == "speed":
-            # Small bonus for velocity magnitude, only if making progress.
-            making_progress = reward > 0
-            vel = self.env.unwrapped.car.hull.linearVelocity
-            speed = np.sqrt(np.sum(np.square(vel)))
-            speed_bonus = 0.1 * speed if making_progress else 0.0
-            return reward + speed_bonus
-        elif self.mode == "precision":
-            # 1. Base reward
-            # 2. Speed bonus (forward only, progress-gated)
-            # 3. Spinning penalty (angular velocity)
-            # 4. Backward sliding penalty
-            car = self.env.unwrapped.car
-            vx, vy = car.hull.linearVelocity
-            angle = car.hull.angle
-            speed = np.sqrt(vx**2 + vy**2)
-            
-            # Unit vector of the car's nose (Box2D CarRacing specific)
-            unit_x, unit_y = -np.sin(angle), np.cos(angle)
-            forward_speed = vx * unit_x + vy * unit_y
-            
-            # Progress Gate: Only reward speed if actually hitting NEW tiles
-            making_progress = reward > 0
-            
-            # Bonuses and Penalties
-            speed_bonus = 0.1 * max(forward_speed, 0) if making_progress else 0.0
-            spin_penalty = 0.5 * abs(car.hull.angularVelocity)
-            backward_penalty = 5.0 if forward_speed < -1.0 else 0.0
-            
-            # Fail-Safe: Penalty for moving fast but NOT making progress (wrong way/off-track)
-            progress_penalty = 1.0 if (not making_progress and speed > 5.0) else 0.0
-            
-            return reward + speed_bonus - spin_penalty - backward_penalty - progress_penalty
-        elif self.mode == "custom":
-            return self._custom_reward(reward, obs, terminated, truncated, info)
+        if self.reward_clip is not None:
+            reward = float(np.clip(reward, -self.reward_clip, self.reward_clip))
+
+        if self._estimate_offtrack(proc):
+            self.offtrack_counter += 1
         else:
-            raise ValueError(f"Unknown reward mode: '{self.mode}'")
+            self.offtrack_counter = 0
 
-    def _custom_reward(self, reward, obs, terminated, truncated, info):
-        """Override this method in a subclass for fully custom rewards."""
-        return reward
+        if self.offtrack_counter >= self.grass_timeout:
+            truncated = True
+            info = dict(info)
+            info["grass_timeout"] = True
+
+        return self._get_stacked_obs(), reward, terminated, truncated, info
 
 
-# ──────────────────────────────────────────────
-# Environment Factory
-# ──────────────────────────────────────────────
-def make_env(render: bool = False, reward_mode: str = "default", seed: int = SEED):
+# ============================================================
+# PPO rollout memory
+# ============================================================
+
+class PPOMemory:
+    """Stores one on-policy rollout for PPO."""
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        self.states: List[np.ndarray] = []
+        self.actions: List[int] = []
+        self.log_probs: List[float] = []
+        self.values: List[float] = []
+        self.rewards: List[float] = []
+        self.dones: List[bool] = []
+
+    def add(
+        self,
+        state: np.ndarray,
+        action: int,
+        log_prob: float,
+        value: float,
+        reward: float,
+        done: bool,
+    ):
+        """Add one transition to the rollout."""
+        self.states.append(state)
+        self.actions.append(action)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.rewards.append(reward)
+        self.dones.append(done)
+
+    def __len__(self) -> int:
+        return len(self.states)
+
+
+# ============================================================
+# Actor-Critic network
+# ============================================================
+
+class ActorCritic(nn.Module):
+    """CNN-based actor-critic for stacked grayscale frames."""
+
+    def __init__(self, input_channels: int, num_actions: int):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, input_channels, 84, 84)
+            feat_dim = self.features(dummy).shape[1]
+
+        self.shared = nn.Sequential(
+            nn.Linear(feat_dim, 512),
+            nn.ReLU(),
+        )
+
+        self.actor = nn.Linear(512, num_actions)
+        self.critic = nn.Linear(512, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return policy logits and state value."""
+        x = self.features(x)
+        x = self.shared(x)
+        logits = self.actor(x)
+        value = self.critic(x)
+        return logits, value
+
+    def get_action_and_value(
+        self,
+        x: torch.Tensor,
+        action: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample an action (or score a provided one), and return:
+        action, log_prob, entropy, value
+        """
+        logits, value = self.forward(x)
+        dist = Categorical(logits=logits)
+        if action is None:
+            action = dist.sample()
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        return action, log_prob, entropy, value.squeeze(-1)
+
+
+@dataclass
+class PPOConfig:
+    total_timesteps: int = TOTAL_TIMESTEPS
+    rollout_steps: int = ROLLOUT_STEPS
+    epochs: int = EPOCHS
+    minibatch_size: int = MINIBATCH_SIZE
+    gamma: float = GAMMA
+    gae_lambda: float = GAE_LAMBDA
+    clip_coef: float = CLIP_COEF
+    ent_coef: float = ENT_COEF
+    vf_coef: float = VF_COEF
+    max_grad_norm: float = MAX_GRAD_NORM
+    learning_rate: float = LEARNING_RATE
+    adam_eps: float = ADAM_EPS
+    anneal_lr: bool = True
+    target_kl: float | None = TARGET_KL
+
+
+class PPOAgent:
+    """PPO agent wrapper around the ActorCritic network and optimizer."""
+
+    def __init__(self, obs_shape: Tuple[int, int, int], num_actions: int, cfg: PPOConfig, device: torch.device):
+        c, _, _ = obs_shape
+        self.cfg = cfg
+        self.device = device
+        self.net = ActorCritic(c, num_actions).to(device)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=cfg.learning_rate, eps=cfg.adam_eps)
+
+    def select_action(self, state: np.ndarray) -> Tuple[int, float, float]:
+        """Select one action for a single state."""
+        state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            action, log_prob, _, value = self.net.get_action_and_value(state_t)
+        return int(action.item()), float(log_prob.item()), float(value.item())
+
+    def value(self, state: np.ndarray) -> float:
+        """Compute value for a single state."""
+        state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            _, value = self.net.forward(state_t)
+        return float(value.item())
+
+    def save(self, path: str, step: int) -> None:
+        """Save model, optimizer, and current step."""
+        torch.save(
+            {
+                "model_state_dict": self.net.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "step": step,
+                "config": vars(self.cfg),
+            },
+            path,
+        )
+
+    def load(self, path: str) -> int:
+        """Load model, optimizer, and return saved step."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.net.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        return int(checkpoint.get("step", 0))
+
+    def _compute_gae(self, memory: PPOMemory, last_value: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute GAE advantages and returns."""
+        rewards = np.array(memory.rewards, dtype=np.float32)
+        values = np.array(memory.values + [last_value], dtype=np.float32)
+        dones = np.array(memory.dones, dtype=np.float32)
+
+        advantages = np.zeros_like(rewards, dtype=np.float32)
+        gae = 0.0
+
+        for t in reversed(range(len(rewards))):
+            next_non_terminal = 1.0 - dones[t]
+            delta = rewards[t] + self.cfg.gamma * values[t + 1] * next_non_terminal - values[t]
+            gae = delta + self.cfg.gamma * self.cfg.gae_lambda * next_non_terminal * gae
+            advantages[t] = gae
+
+        returns = advantages + values[:-1]
+        return torch.tensor(advantages, dtype=torch.float32), torch.tensor(returns, dtype=torch.float32)
+
+    def update(self, memory: PPOMemory, last_value: float, progress: float) -> Dict[str, float]:
+        """Run one PPO update using the stored rollout."""
+        cfg = self.cfg
+
+        if cfg.anneal_lr:
+            frac = 1.0 - progress
+            lr_now = frac * cfg.learning_rate
+            self.optimizer.param_groups[0]["lr"] = lr_now
+        else:
+            lr_now = self.optimizer.param_groups[0]["lr"]
+
+        states = torch.tensor(np.array(memory.states), dtype=torch.float32, device=self.device)
+        actions = torch.tensor(memory.actions, dtype=torch.long, device=self.device)
+        old_log_probs = torch.tensor(memory.log_probs, dtype=torch.float32, device=self.device)
+        advantages, returns = self._compute_gae(memory, last_value)
+        advantages = advantages.to(self.device)
+        returns = returns.to(self.device)
+        values_old = torch.tensor(memory.values, dtype=torch.float32, device=self.device)
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        batch_size = states.shape[0]
+        indices = np.arange(batch_size)
+
+        clipfracs = []
+        approx_kl = 0.0
+        entropy_loss = 0.0
+        policy_loss = 0.0
+        value_loss = 0.0
+
+        for _ in range(cfg.epochs):
+            np.random.shuffle(indices)
+
+            for start in range(0, batch_size, cfg.minibatch_size):
+                end = start + cfg.minibatch_size
+                mb_idx = indices[start:end]
+
+                _, new_log_probs, entropy, new_values = self.net.get_action_and_value(states[mb_idx], actions[mb_idx])
+                log_ratio = new_log_probs - old_log_probs[mb_idx]
+                ratio = log_ratio.exp()
+
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+                    clipfracs.append(((ratio - 1.0).abs() > cfg.clip_coef).float().mean().item())
+
+                mb_adv = advantages[mb_idx]
+                pg_loss1 = -mb_adv * ratio
+                pg_loss2 = -mb_adv * torch.clamp(ratio, 1.0 - cfg.clip_coef, 1.0 + cfg.clip_coef)
+                policy_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                new_values = new_values.view(-1)
+                v_loss_unclipped = (new_values - returns[mb_idx]) ** 2
+                v_clipped = values_old[mb_idx] + torch.clamp(
+                    new_values - values_old[mb_idx],
+                    -cfg.clip_coef,
+                    cfg.clip_coef,
+                )
+                v_loss_clipped = (v_clipped - returns[mb_idx]) ** 2
+                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+                entropy_loss = entropy.mean()
+                loss = policy_loss - cfg.ent_coef * entropy_loss + cfg.vf_coef * value_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
+                self.optimizer.step()
+
+            if cfg.target_kl is not None and approx_kl > cfg.target_kl:
+                break
+
+        return {
+            "lr": float(lr_now),
+            "policy_loss": float(policy_loss.item()),
+            "value_loss": float(value_loss.item()),
+            "entropy": float(entropy_loss.item()),
+            "approx_kl": float(approx_kl),
+            "clipfrac": float(np.mean(clipfracs) if clipfracs else 0.0),
+        }
+
+
+# ============================================================
+# Environment factory
+# ============================================================
+
+def make_env(render: bool = False, seed: int = SEED) -> gym.Env:
     """
-    Create a discrete CarRacing-v3 environment.
+    Create and wrap a CarRacing-v3 environment.
 
-    Important:
-      continuous=True gives a discrete action space, which matches your PPO
-      implementation based on Categorical action sampling.
+    The SAC.py file includes reward-related args, but PPO.py does not need
+    SAC's reward wrapper. So only the overlapping, necessary workflow ideas
+    were copied here. :contentReference[oaicite:1]{index=1}
     """
     render_mode = "human" if render else None
     env = gym.make("CarRacing-v3", continuous=True, render_mode=render_mode)
-    env = RewardWrapper(env, mode=reward_mode)
+    env = DiscreteCarRacingWrapper(env)
+    env = CarRacingPreprocess(env)
     return env
 
 
-# ──────────────────────────────────────────────
-# Original PPO Memory
-# ──────────────────────────────────────────────
-class PPOMemory:
-    """
-    Stores one rollout / trajectory of experience for PPO training.
-
-    PPO does not usually learn from a single transition immediately.
-    Instead, it collects many transitions:
-        state, action, old log-prob, critic value, reward, done
-    and then trains on batches from that stored data.
-
-    Attributes:
-        states      : list of observed states
-        probs       : list of old log-probabilities of chosen actions
-        vals        : list of critic value estimates V(s)
-        actions     : list of actions taken
-        rewards     : list of rewards received
-        dones       : list of terminal flags (True if episode ended)
-        batch_size  : number of samples per mini-batch during training
-    """
-    def __init__(self, batch_size):
-        """
-        Args:
-            batch_size (int): size of each training mini-batch.
-                              Common values: 32, 64, 128, 256
-                              Must be >= 1.
-        """
-        self.states = []      # Stores environment observations (states)
-        self.probs = []       # Stores log-probabilities of selected actions under old policy
-        self.vals = []        # Stores critic estimates V(s) at the time of action selection
-        self.actions = []     # Stores actions taken
-        self.rewards = []     # Stores rewards from environment
-        self.dones = []       # Stores whether each step ended an episode
-        self.batch_size = batch_size
-
-    def generate_batches(self):
-        """
-        Converts stored memory into NumPy arrays and creates shuffled mini-batches.
-
-        Returns:
-            states  (np.array): all stored states
-            actions (np.array): all stored actions
-            probs   (np.array): all stored old log-probabilities
-            vals    (np.array): all stored state-value estimates
-            rewards (np.array): all stored rewards
-            dones   (np.array): all stored done flags
-            batches (list[np.array]): list of arrays of shuffled indices for mini-batches
-
-        Notes:
-            - The total number of stored transitions is n_states.
-            - Data is shuffled before batching, which helps training stability.
-        """
-        n_states = len(self.states)  # Total number of stored transitions
-
-        # Starting indices of each batch: [0, batch_size, 2*batch_size, ...]
-        batch_start = np.arange(0, n_states, self.batch_size)
-
-        # Indices for all samples, e.g. [0, 1, 2, ..., n_states-1]
-        indices = np.arange(n_states, dtype=np.int64)
-
-        # Shuffle indices so batches are random
-        np.random.shuffle(indices)
-
-        # Slice shuffled indices into mini-batches
-        batches = [indices[i:i + self.batch_size] for i in batch_start]
-
-        # Return everything as arrays for easier vectorized operations
-        return (
-            np.array(self.states),
-            np.array(self.actions),
-            np.array(self.probs),
-            np.array(self.vals),
-            np.array(self.rewards),
-            np.array(self.dones),
-            batches
-        )
-        
-    def store_memory(self, state, prob, val, action, reward, done):
-        """
-        Stores one transition in memory.
-
-        Args:
-            state  : observation/state from environment
-            prob   : log-probability of selected action under current actor policy
-            val    : critic estimate V(state)
-            action : action taken by agent
-            reward : reward received after taking action
-            done   : whether this transition ended the episode
-
-        Typical ranges:
-            state  : depends entirely on environment
-            prob   : log-probability, usually <= 0
-            val    : any real number, depends on reward scale
-            action : integer in [0, n_actions-1] for discrete action spaces
-            reward : environment-specific, often small values like [-1, 1], but not always
-            done   : boolean (True/False)
-        """
-        self.states.append(state)
-        self.probs.append(prob)
-        self.vals.append(val)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.dones.append(done)
-        
-    def clear_memory(self):
-        """
-        Clears all stored rollout data after PPO finishes training on it.
-        """
-        self.states = []
-        self.probs = []
-        self.vals = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-
-
-# ──────────────────────────────────────────────
-# Original Actor Network
-# ──────────────────────────────────────────────
-class ActorNetwork(nn.Module):
-    """
-    Continuous-action policy network for PPO.
-
-    Outputs a Gaussian policy:
-      - mean for each action dimension
-      - learnable log standard deviation
-
-    Designed for Box action spaces like CarRacing-v3 with continuous=True.
-    """
-    def __init__(self, n_actions, input_dims, alpha, fc1_dims=256, fc2_dims=256):
-        super(ActorNetwork, self).__init__()
-
-        input_dim = input_dims[0] if isinstance(input_dims, tuple) else input_dims
-
-        # Shared feature extractor
-        self.actor = nn.Sequential(
-            nn.Linear(input_dim, fc1_dims),
-            nn.ReLU(),
-            nn.Linear(fc1_dims, fc2_dims),
-            nn.ReLU(),
-        )
-
-        # Mean output for each action dimension
-        self.mu = nn.Linear(fc2_dims, n_actions)
-
-        # Learnable log standard deviation for each action dimension
-        self.log_std = nn.Parameter(T.zeros(n_actions))
-
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-        self.device = DEVICE
-        self.to(self.device)
-
-    def forward(self, state):
-        """
-        Returns a Normal distribution over continuous actions.
-        """
-        x = self.actor(state)
-        mu = self.mu(x)
-
-        # Expand log_std to match batch dimension
-        std = T.exp(self.log_std).expand_as(mu)
-
-        dist = Normal(mu, std)
-        return dist
-        
-        
-# ──────────────────────────────────────────────
-# Original Critic Network
-# ──────────────────────────────────────────────
-class CriticNetwork(nn.Module):
-    """
-    Value network for PPO.
-
-    This network estimates the state-value function V(s), which is the expected
-    future return from a given state.
-
-    Architecture:
-        state -> Linear -> ReLU -> Linear -> ReLU -> Linear -> scalar value
-    """
-    def __init__(self, input_dims, alpha, fc1_dims=256, fc2_dims=256):
-        """
-        Args:
-            input_dims (tuple): shape of state input
-            alpha (float): learning rate for Adam optimizer
-            fc1_dims (int): neurons in first hidden layer
-            fc2_dims (int): neurons in second hidden layer
-        """
-        super(CriticNetwork, self).__init__()
-        
-        # File path where critic weights will be saved
-        self.checkpoint_file = os.path.join('tmp/ppo', 'critic_torch_ppo')
-
-        # Critic outputs a single scalar value for each state
-        self.critic = nn.Sequential(
-            nn.Linear(*input_dims, fc1_dims),
-            nn.ReLU(),
-            nn.Linear(fc1_dims, fc2_dims),
-            nn.ReLU(),
-            nn.Linear(fc2_dims, 1)
-        )
-        
-        # Optimizer for critic
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
-
-        # Use GPU if available
-        self.device = DEVICE
-
-        # Move model to selected device
-        self.to(self.device)
-
-    def forward(self, state):
-        """
-        Runs a forward pass through the critic.
-
-        Args:
-            state (Tensor): tensor of states
-
-        Returns:
-            value (Tensor): predicted state value V(s), shape [batch_size, 1]
-        """
-        value = self.critic(state)
-        
-        return value
-    
-    def save_checkpoint(self, checkpoint_dir='tmp/ppo'):
-        """
-        Saves critic network weights to disk.
-        """
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        save_path = os.path.join(checkpoint_dir, 'critic_torch_ppo')
-        T.save(self.state_dict(), save_path)
-        
-    def load_checkpoint(self, checkpoint_dir='tmp/ppo'):
-        """
-        Loads critic network weights from disk.
-        """
-        load_path = os.path.join(checkpoint_dir, 'critic_torch_ppo')
-        self.load_state_dict(T.load(load_path, map_location=self.device))
-
-
-# ──────────────────────────────────────────────
-# Original PPO Agent
-# ──────────────────────────────────────────────
-class PPOAgent:
-    """
-    Main PPO agent class.
-
-    This class combines:
-        - actor network (policy)
-        - critic network (value function)
-        - memory buffer
-        - action selection
-        - PPO learning update
-
-    PPO is an on-policy algorithm, so the memory contains data generated by the
-    current policy, and after learning, memory is cleared.
-    """
-    def __init__(
-        self,
-        n_actions,
-        input_dims,
-        alpha=LEARNING_RATE,
-        gamma=GAMMA,
-        gae_lambda=GAE_LAMBDA,
-        policy_clip=POLICY_CLIP,
-        batch_size=BATCH_SIZE,
-        N=ROLLOUT_STEPS,
-        n_epochs=N_EPOCHS
-    ):
-        """
-        Args:
-            n_actions (int): number of discrete actions
-            input_dims (tuple): shape of observation/state
-            alpha (float): learning rate
-                           Typical PPO range: 1e-5 to 3e-4
-            gamma (float): discount factor for future rewards
-                           Typical range: 0.95 to 0.999
-                           Must be in [0, 1]
-            gae_lambda (float): lambda for Generalized Advantage Estimation
-                                Typical range: 0.9 to 0.99
-                                Must be in [0, 1]
-            policy_clip (float): PPO clipping epsilon
-                                 Typical range: 0.1 to 0.3
-                                 Must be > 0
-            batch_size (int): size of training mini-batches
-                              Common: 32, 64, 128, 256
-            N (int): rollout length / number of steps collected before learning
-                     Common: 1024, 2048, 4096
-                     Note: in this code, N is passed but never actually stored or used.
-            n_epochs (int): number of times PPO trains over collected rollout data
-                            Common: 3 to 10
-        """
-        self.alpha = alpha                    # Learning rate for optimizers
-        self.gamma = gamma                    # Discount factor for future rewards
-        self.gae_lambda = gae_lambda          # Controls bias/variance tradeoff in GAE
-        self.policy_clip = policy_clip        # PPO clipping threshold
-        self.n_epochs = n_epochs              # Number of epochs per PPO update
-        
-        self.actor = ActorNetwork(n_actions, input_dims, alpha)   # Policy network
-        self.critic = CriticNetwork(input_dims, alpha)            # Value network
-        self.memory = PPOMemory(batch_size)                       # Rollout memory
-        
-    def remember(self, state, prob, val, action, reward, done):
-        """
-        Stores one experience tuple in PPO memory.
-        Usually called once per environment step.
-
-        Args:
-            state  : observation before action
-            prob   : log-probability of chosen action
-            val    : critic estimate of state value
-            action : action selected
-            reward : reward received
-            done   : episode termination flag
-        """
-        self.memory.store_memory(state, prob, val, action, reward, done)
-        
-    def save_models(self, filepath):
-        """
-        Saves both actor and critic parameters into one .pt checkpoint file.
-        """
-        print('... saving model ...')
-        T.save({
-            'actor_state_dict': self.actor.state_dict(),
-            'critic_state_dict': self.critic.state_dict()
-        }, filepath)
-        
-    def load_models(self, filepath):
-        """
-        Loads both actor and critic parameters from one .pt checkpoint file.
-        """
-        print('... loading model ...')
-        filepath = os.path.join(SAVE_DIR, filepath)
-        checkpoint = T.load(filepath, map_location=self.actor.device)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        
-    def choose_action(self, observation):
-        """
-        Select a continuous action using the current Gaussian policy.
-
-        Returns:
-            env_action : action sent to the CarRacing environment
-            probs      : log-probability of the RAW sampled action
-            value      : critic estimate V(s)
-            raw_action : raw Gaussian sample stored for PPO training
-        """
-        state = T.tensor([observation], dtype=T.float).to(self.actor.device)
-
-        dist = self.actor(state)
-        value = self.critic(state)
-
-        # Sample RAW action from Gaussian policy
-        raw_action = dist.sample()
-
-        # PPO should store log-prob of the RAW action
-        probs = dist.log_prob(raw_action).sum(dim=-1)
-        probs = T.squeeze(probs).item()
-
-        # Transform raw action into valid CarRacing controls
-        env_action = raw_action.clone()
-
-        # steering in [-1, 1]
-        env_action[..., 0] = T.tanh(env_action[..., 0])
-
-        # gas in [0.2, 1.0] so the car actually accelerates
-        env_action[..., 1] = 0.2 + 0.8 * T.sigmoid(env_action[..., 1])
-
-        # brake in [0, 1]
-        env_action[..., 2] = T.sigmoid(env_action[..., 2])
-
-        env_action = T.squeeze(env_action).detach().cpu().numpy()
-        raw_action = T.squeeze(raw_action).detach().cpu().numpy()
-        value = T.squeeze(value).item()
-
-        return env_action, probs, value, raw_action
-        
-    def learn(self):
-        """
-        Performs PPO training using all data currently stored in memory.
-
-        Important for continuous control:
-            - the stored actions must be the RAW Gaussian samples
-            - log-probs are computed on those raw actions
-            - only the environment receives the transformed action
-        """
-        for _ in range(self.n_epochs):
-            # Retrieve stored rollout data and mini-batches
-            state_arr, action_arr, old_prob_arr, vals_arr, reward_arr, dones_arr, batches = self.memory.generate_batches()
-
-            values = vals_arr
-
-            # Advantage array stores how much better/worse an action was than expected
-            advantage = np.zeros(len(reward_arr), dtype=np.float32)
-
-            # Compute advantage for each timestep
-            for t in range(len(reward_arr) - 1):
-                discount = 1
-                a_t = 0
-
-                for k in range(t, len(reward_arr) - 1):
-                    a_t += discount * (
-                        reward_arr[k]
-                        + self.gamma * values[k + 1] * (1 - int(dones_arr[k]))
-                        - values[k]
-                    )
-                    discount *= self.gamma * self.gae_lambda
-
-                advantage[t] = a_t
-
-            advantage = T.tensor(advantage, dtype=T.float).to(self.actor.device)
-            values = T.tensor(values, dtype=T.float).to(self.actor.device)
-
-            for batch in batches:
-                # Extract batch data and convert to tensors
-                states = T.tensor(state_arr[batch], dtype=T.float).to(self.actor.device)
-                old_probs = T.tensor(old_prob_arr[batch], dtype=T.float).to(self.actor.device)
-                actions = T.tensor(action_arr[batch], dtype=T.float).to(self.actor.device)
-
-                # Forward pass through actor and critic with CURRENT parameters
-                dist = self.actor(states)
-                critic_value = self.critic(states).squeeze()
-
-                # Log-prob of the SAME RAW actions under updated policy
-                new_probs = dist.log_prob(actions).sum(dim=-1)
-
-                # Probability ratio
-                prob_ratio = (new_probs - old_probs).exp()
-
-                # PPO clipped objective
-                weighted_probs = advantage[batch] * prob_ratio
-                weighted_clipped_probs = T.clamp(
-                    prob_ratio,
-                    1 - self.policy_clip,
-                    1 + self.policy_clip
-                ) * advantage[batch]
-
-                actor_loss = -T.min(weighted_probs, weighted_clipped_probs).mean()
-
-                # Critic target = return = advantage + old value estimate
-                returns = advantage[batch] + values[batch]
-                critic_loss = ((returns - critic_value) ** 2).mean()
-
-                total_loss = actor_loss + 0.5 * critic_loss
-
-                self.actor.optimizer.zero_grad()
-                self.critic.optimizer.zero_grad()
-                total_loss.backward()
-                self.actor.optimizer.step()
-                self.critic.optimizer.step()
-
-        self.memory.clear_memory()
-
-
-# ──────────────────────────────────────────────
-# PPO + CarRacing Helpers
-# ──────────────────────────────────────────────
-def evaluate_agent(agent: PPOAgent,
-                   num_episodes: int = NUM_EVAL_EPISODES,
-                   reward_mode: str = "default",
-                   seed: int = SEED) -> float:
-    """
-    Evaluate the PPO agent on CarRacing-v3 using stacked frames.
-    """
-    eval_env = make_env(render=False, reward_mode=reward_mode, seed=seed + 100)
+# ============================================================
+# Evaluation
+# ============================================================
+
+def evaluate(agent: PPOAgent, num_episodes: int = NUM_EVAL_EPS, seed: int = SEED) -> float:
+    """Run evaluation and return mean reward."""
+    eval_env = make_env(render=False, seed=seed + 100)
     total_reward = 0.0
 
     for ep in range(num_episodes):
-        obs, info = eval_env.reset(seed=seed + 100 + ep)
-
-        frame_stack = FrameStack(n=FRAME_STACK)
-        state = frame_stack.reset(obs)
-
+        state, _ = eval_env.reset(seed=seed + ep)
         done = False
         ep_reward = 0.0
 
         while not done:
-            env_action, prob, val, raw_action = agent.choose_action(state)
-            next_obs, reward, terminated, truncated, info = eval_env.step(env_action)
-            state = frame_stack.step(next_obs)
-
-            ep_reward += reward
+            action, _, _ = agent.select_action(state)
+            state, reward, terminated, truncated, _ = eval_env.step(action)
             done = terminated or truncated
+            ep_reward += reward
 
         total_reward += ep_reward
 
@@ -752,241 +584,186 @@ def evaluate_agent(agent: PPOAgent,
     return total_reward / num_episodes
 
 
-def render_agent(agent: PPOAgent,
-                 checkpoint_dir: str,
-                 reward_mode: str = "default",
-                 episodes: int = RENDER_EPISODES):
-    """
-    Render a trained PPO agent using stacked frames.
-    """
-    agent.load_models(checkpoint_dir)
-
-    env = make_env(render=True, reward_mode=reward_mode)
-    for ep in range(episodes):
-        obs, info = env.reset()
-
-        frame_stack = FrameStack(n=FRAME_STACK)
-        state = frame_stack.reset(obs)
-
-        done = False
-        total_reward = 0.0
-
-        while not done:
-            env_action, prob, val, raw_action = agent.choose_action(state)
-            obs, reward, terminated, truncated, info = env.step(env_action)
-            state = frame_stack.step(obs)
-            total_reward += reward
-            done = terminated or truncated
-
-        print(f"[PPO] Render Episode {ep + 1}: Reward = {total_reward:.2f}")
-
-    env.close()
-
-
-def train_ppo_on_carracing(
-    total_timesteps: int = TOTAL_TIMESTEPS,
-    rollout_steps: int = ROLLOUT_STEPS,
-    eval_every: int = EVAL_EVERY,
-    reward_mode: str = "default",
-    save_dir: str = SAVE_DIR,
-    seed: int = SEED,
-    alpha: float = LEARNING_RATE,
-    gamma: float = GAMMA,
-    gae_lambda: float = GAE_LAMBDA,
-    policy_clip: float = POLICY_CLIP,
-    batch_size: int = BATCH_SIZE,
-    n_epochs: int = N_EPOCHS
-):
-    """
-    Train the PPO agent on Gymnasium CarRacing-v3.
-
-    This function:
-      1. Creates the environment
-      2. Preprocesses image observations into flat vectors
-      3. Collects on-policy rollouts
-      4. Calls agent.learn() every `rollout_steps`
-      5. Periodically evaluates and saves the model
-    """
-    set_seed(seed)
-    os.makedirs(save_dir, exist_ok=True)
-
-    log_file = os.path.join(save_dir, "progress.csv")
-    if not os.path.exists(log_file):
-        with open(log_file, "w") as f:
-            f.write("step,reward\n")
-
-    env = make_env(render=False, reward_mode=reward_mode, seed=seed)
-    obs, info = env.reset(seed=seed)
-
-    frame_stack = FrameStack(n=FRAME_STACK)
-    state = frame_stack.reset(obs)
-
-    agent = PPOAgent(
-        n_actions=env.action_space.shape[0],
-        input_dims=get_input_dims_from_env(),
-        alpha=alpha,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        policy_clip=policy_clip,
-        batch_size=batch_size,
-        N=rollout_steps,
-        n_epochs=n_epochs
-    )
-
-    print(f"[PPO] Starting training for {total_timesteps} steps...")
-    print(f"[PPO] Device: {DEVICE} | Reward Mode: {reward_mode}")
-    print(f"[PPO] Continuous action space size: {env.action_space.shape[0]}")
-    print(f"[PPO] Input dims: {get_input_dims_from_env()}")
-
-    start_time = time.time()
-    episode_reward = 0.0
-    episode_num = 1
-
-    for step in range(1, total_timesteps + 1):
-        # Choose action from current PPO policy
-        env_action, prob, val, raw_action = agent.choose_action(state)
-
-        # Step the environment
-        next_obs, reward, terminated, truncated, info = env.step(env_action)
-        next_state = frame_stack.step(next_obs)
-
-        done = terminated or truncated
-
-        # Store transition in PPO memory
-        agent.remember(state, prob, val, raw_action, reward, done)
-
-        state = next_state
-        episode_reward += reward
-
-        # PPO update after collecting enough rollout steps
-        if step % rollout_steps == 0:
-            agent.learn()
-
-        # Handle episode termination
-        if done:
-            print(f"[PPO] Episode {episode_num} | Step {step} | Reward: {episode_reward:.2f}")
-            obs, info = env.reset()
-            frame_stack = FrameStack(n=FRAME_STACK)
-            state = frame_stack.reset(obs)
-            episode_reward = 0.0
-            episode_num += 1
-
-        # Periodic evaluation
-        if step % eval_every == 0:
-            avg_reward = evaluate_agent(
-                agent,
-                num_episodes=NUM_EVAL_EPISODES,
-                reward_mode=reward_mode,
-                seed=seed
-            )
-
-            elapsed = time.time() - start_time
-            fps = int(step / elapsed) if elapsed > 0 else 0
-
-            print(f"[PPO] [{step}/{total_timesteps}] Eval Reward: {avg_reward:.2f} | FPS: {fps}")
-
-            with open(log_file, "a") as f:
-                f.write(f"{step},{avg_reward}\n")
-
-        # Periodic checkpoint
-        if step % EVAL_EVERY == 0:
-            checkpoint_dir = os.path.join(save_dir, f"ppo_car_{step}.pt")
-            agent.save_models(checkpoint_dir)
-
-    # Final save
-    final_path = os.path.join(save_dir, "ppo_car_final.pt")
-    agent.save_models(final_path)
-
-    env.close()
-    print(f"[PPO] Training complete! Results saved to {save_dir}")
-
-
-# ──────────────────────────────────────────────
+# ============================================================
 # CLI Argument Parser
-# ──────────────────────────────────────────────
-def parse_args():
-    parser = argparse.ArgumentParser(description="PPO for CarRacing-v3 (Discrete)")
+# ============================================================
 
-    # Training
+def parse_args():
+    """
+    Only includes CLI args that exist in the SAC.py file you sent,
+    and only keeps the ones that are actually needed for PPO.py. :contentReference[oaicite:2]{index=2}
+    """
+    parser = argparse.ArgumentParser(description="PPO for CarRacing-v3")
+
+    # Training / runtime args that exist in SAC.py
     parser.add_argument("--total-timesteps", type=int, default=TOTAL_TIMESTEPS)
-    parser.add_argument("--rollout-steps", type=int, default=ROLLOUT_STEPS)
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY)
-    parser.add_argument("--alpha", type=float, default=LEARNING_RATE)
-    parser.add_argument("--gamma", type=float, default=GAMMA)
-    parser.add_argument("--gae-lambda", type=float, default=GAE_LAMBDA)
-    parser.add_argument("--policy-clip", type=float, default=POLICY_CLIP)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--n-epochs", type=int, default=N_EPOCHS)
     parser.add_argument("--seed", type=int, default=SEED)
 
-    # Reward shaping
-    parser.add_argument(
-        "--reward-mode",
-        type=str,
-        default="default",
-        choices=["default", "clip", "oldspeed", "speed", "precision", "custom"],
-        help="Reward wrapper mode."
-    )
+    # Evaluation / rendering / resume args that exist in SAC.py
+    parser.add_argument("--render", action="store_true", help="Render a trained agent using --checkpoint.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt for render/eval mode.")
+    parser.add_argument("--load-checkpoint", type=str, default=None, help="Path to .pt to resume training from.")
+    parser.add_argument("--start-step", type=int, default=0, help="Initial step count (to match loaded checkpoint).")
 
-    # Output
-    parser.add_argument("--save-dir", type=str, default=SAVE_DIR)
-
-    # Rendering / loading
-    parser.add_argument("--render", action="store_true", help="Render a trained PPO agent.")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to a PPO .pt checkpoint file."
-    )
+    # Output arg that exists in SAC.py
+    parser.add_argument("--save-dir", type=str, default="ppo_results",
+                        help="Directory for checkpoints and logs.")
 
     return parser.parse_args()
 
 
-# ──────────────────────────────────────────────
-# Main Execution
-# ──────────────────────────────────────────────
+# ============================================================
+# Main Execution Loop
+# ============================================================
+
 if __name__ == "__main__":
     args = parse_args()
+    set_seed(args.seed)
 
-    # Render mode
+    # Create results directory
+    os.makedirs(args.save_dir, exist_ok=True)
+    log_file = os.path.join(args.save_dir, "progress.csv")
+    latest_checkpoint_path = os.path.join(args.save_dir, "ppo_carracing.pt")
+
+    maybe_init_csv(log_file)
+
+    # Initialize environment and agent
+    env = make_env(render=False, seed=args.seed)
+    obs, _ = env.reset(seed=args.seed)
+
+    cfg = PPOConfig(total_timesteps=args.total_timesteps)
+    agent = PPOAgent(env.observation_space.shape, env.action_space.n, cfg, DEVICE)
+
+    # Rendering / evaluation mode
     if args.render:
         if args.checkpoint is None:
-            print("[PPO] Error: Must provide --checkpoint to render a trained model.")
+            print("[PPO] Error: Must provide --checkpoint to render.")
         else:
-            # Create a dummy env just to get action space size
-            dummy_env = make_env(render=False, reward_mode=args.reward_mode, seed=args.seed)
-            agent = PPOAgent(
-                n_actions=dummy_env.action_space.shape[0],
-                input_dims=get_input_dims_from_env(),
-                alpha=args.alpha,
-                gamma=args.gamma,
-                gae_lambda=args.gae_lambda,
-                policy_clip=args.policy_clip,
-                batch_size=args.batch_size,
-                N=args.rollout_steps,
-                n_epochs=args.n_epochs
-            )
-            dummy_env.close()
+            print(f"[PPO] Rendering agent from {args.checkpoint}...")
+            step = agent.load(args.checkpoint)
+            print(f"[PPO] Loaded checkpoint at step {step}")
 
-            render_agent(
-                agent=agent,
-                checkpoint_dir=args.checkpoint,
-                reward_mode=args.reward_mode,
-                episodes=RENDER_EPISODES
+            eval_env = make_env(render=True, seed=args.seed)
+            for ep in range(5):
+                state, _ = eval_env.reset(seed=args.seed + ep)
+                done = False
+                total_r = 0.0
+                ep_len = 0
+
+                while not done:
+                    action, _, _ = agent.select_action(state)
+                    state, reward, terminated, truncated, _ = eval_env.step(action)
+                    total_r += reward
+                    ep_len += 1
+                    done = terminated or truncated
+
+                print(f"Episode {ep + 1}: Reward = {total_r:.2f} | Length = {ep_len}")
+
+            eval_env.close()
+        raise SystemExit
+
+    # Resume training from checkpoint if requested
+    global_step = args.start_step
+    if args.load_checkpoint:
+        print(f"[PPO] Loading checkpoint from {args.load_checkpoint} to resume training...")
+        global_step = agent.load(args.load_checkpoint)
+
+    print(f"[PPO] Starting training for {args.total_timesteps} steps (from step {global_step})...")
+    print(f"[PPO] Device: {DEVICE}")
+
+    memory = PPOMemory()
+    state = obs
+
+    start_time = time.time()
+    episode_reward = 0.0
+    episode_length = 0
+    episode_count = 0
+    recent_rewards = collections.deque(maxlen=20)
+
+    for t in range(global_step + 1, args.total_timesteps + 1):
+        # Collect rollout data
+        action, log_prob, value = agent.select_action(state)
+        next_state, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+
+        memory.add(state, action, log_prob, value, reward, done)
+
+        state = next_state
+        episode_reward += reward
+        episode_length += 1
+
+        # Episode end handling
+        if done:
+            recent_rewards.append(episode_reward)
+            episode_count += 1
+            timeout_flag = info.get("grass_timeout", False)
+            print(
+                f"Episode {episode_count:4d} | "
+                f"step {t:8d} | "
+                f"reward {episode_reward:8.2f} | "
+                f"length {episode_length:4d} | "
+                f"grass_timeout={timeout_flag}"
             )
-    else:
-        train_ppo_on_carracing(
-            total_timesteps=args.total_timesteps,
-            rollout_steps=args.rollout_steps,
-            eval_every=args.eval_every,
-            reward_mode=args.reward_mode,
-            save_dir=args.save_dir,
-            seed=args.seed,
-            alpha=args.alpha,
-            gamma=args.gamma,
-            gae_lambda=args.gae_lambda,
-            policy_clip=args.policy_clip,
-            batch_size=args.batch_size,
-            n_epochs=args.n_epochs
-        )
+            state, _ = env.reset()
+            episode_reward = 0.0
+            episode_length = 0
+
+        # PPO update once rollout buffer is full
+        metrics = None
+        if len(memory) >= cfg.rollout_steps:
+            if memory.dones and memory.dones[-1]:
+                last_value = 0.0
+            else:
+                last_value = agent.value(state)
+
+            progress = t / max(1, cfg.total_timesteps)
+            metrics = agent.update(memory, last_value, progress)
+            memory.clear()
+
+        # Evaluate, log CSV, and save checkpoint every eval_every steps
+        if t % args.eval_every == 0:
+            avg_eval_reward = evaluate(agent, num_episodes=NUM_EVAL_EPS, seed=args.seed)
+            elapsed = time.time() - start_time
+            fps = int((t - global_step) / elapsed) if elapsed > 0 else 0
+
+            if metrics is not None:
+                print(
+                    f"[{t}/{args.total_timesteps}] "
+                    f"Eval Reward: {avg_eval_reward:.2f} | "
+                    f"FPS: {fps} | "
+                    f"Policy Loss: {metrics['policy_loss']:.4f} | "
+                    f"Value Loss: {metrics['value_loss']:.4f} | "
+                    f"Entropy: {metrics['entropy']:.4f}"
+                )
+
+                append_csv_row(
+                    log_file,
+                    [
+                        t,
+                        avg_eval_reward,
+                        metrics["policy_loss"],
+                        metrics["value_loss"],
+                        metrics["entropy"],
+                        metrics["approx_kl"],
+                        metrics["clipfrac"],
+                        metrics["lr"],
+                    ],
+                )
+            else:
+                print(f"[{t}/{args.total_timesteps}] Eval Reward: {avg_eval_reward:.2f} | FPS: {fps}")
+
+                append_csv_row(
+                    log_file,
+                    [t, avg_eval_reward, 0, 0, 0, 0, 0, 0],
+                )
+
+            checkpoint_path = os.path.join(args.save_dir, f"ppo_carracing_{t}.pt")
+            agent.save(checkpoint_path, t)
+            agent.save(latest_checkpoint_path, t)
+            print(f"[PPO] Saved checkpoints to {checkpoint_path} and {latest_checkpoint_path}")
+
+    # Final save
+    agent.save(latest_checkpoint_path, args.total_timesteps)
+    print(f"[PPO] Training complete! Results saved to {args.save_dir}")
+    env.close()
