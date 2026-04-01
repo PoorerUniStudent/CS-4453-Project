@@ -161,14 +161,25 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
             # 7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
             # 8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
         
+        # v2:
+            # 0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            # 1: np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+            # 2: np.array([1.0, 0.0, 0.0], dtype=np.float32),
+            # 3: np.array([0.0, 0.4, 0.0], dtype=np.float32),
+            # 4: np.array([0.0, 0.0, 0.9], dtype=np.float32),
+            # 5: np.array([-0.6, 0.25, 0.0], dtype=np.float32),
+            # 6: np.array([0.6, 0.25, 0.0], dtype=np.float32),
+            # 7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
+            # 8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
+        
         self._actions = {
             0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
             1: np.array([-1.0, 0.0, 0.0], dtype=np.float32),
             2: np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            3: np.array([0.0, 0.4, 0.0], dtype=np.float32),
+            3: np.array([0.0, 0.6, 0.0], dtype=np.float32),
             4: np.array([0.0, 0.0, 0.9], dtype=np.float32),
-            5: np.array([-0.6, 0.25, 0.0], dtype=np.float32),
-            6: np.array([0.6, 0.25, 0.0], dtype=np.float32),
+            5: np.array([-0.6, 0.4, 0.0], dtype=np.float32),
+            6: np.array([0.6, 0.4, 0.0], dtype=np.float32),
             7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
             8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
         }
