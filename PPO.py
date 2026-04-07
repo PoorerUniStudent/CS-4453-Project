@@ -124,6 +124,104 @@ def append_csv_row(csv_path: str, row: List[object]) -> None:
         writer = csv.writer(f)
         writer.writerow(row)
 
+class RewardWrapper(gym.Wrapper):
+    """
+    Reward wrapper for CarRacing.
+
+    Modes:
+      - "default": use the environment reward unchanged
+      - "shaped": apply
+            * reward for first-time visits to new position cells
+            * penalty for excessive spinning
+            * small per-step time penalty
+    """
+
+    def __init__(self, env: gym.Env, mode: str = "default", cell_size: float = 3.0):
+        super().__init__(env)
+        self.mode = mode
+
+        # Track visited map cells for the current episode
+        self.visited_cells = set()
+
+        # Track how many steps have happened in the current episode
+        self.episode_steps = 0
+
+        # Size of each position-grid cell
+        self.cell_size = cell_size
+
+    def reset(self, **kwargs):
+        """Reset environment and reward-shaping state."""
+        obs, info = self.env.reset(**kwargs)
+        self.visited_cells.clear()
+        self.episode_steps = 0
+        return obs, info
+
+    def _get_position_cell(self):
+        """
+        Convert the car's continuous (x, y) position into a coarse grid cell.
+        This replaces the broken tile-based approach.
+        """
+        car = self.env.unwrapped.car
+        x, y = car.hull.position
+        cell_x = int(x / self.cell_size)
+        cell_y = int(y / self.cell_size)
+        return (cell_x, cell_y)
+
+    def step(self, action):
+        """Apply reward shaping depending on the selected mode."""
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        info = dict(info)
+        info["raw_reward"] = float(reward)
+
+        self.episode_steps += 1
+
+        if self.mode == "default":
+            shaped_reward = reward
+            info["new_progress_bonus"] = 0.0
+            info["spin_penalty"] = 0.0
+            info["time_penalty"] = 0.0
+
+        elif self.mode == "shaped":
+            car = self.env.unwrapped.car
+
+            # --------------------------------------------
+            # Reward entering a new position cell
+            # --------------------------------------------
+            current_cell = self._get_position_cell()
+            if current_cell not in self.visited_cells:
+                self.visited_cells.add(current_cell)
+                new_progress_bonus = 1.0
+            else:
+                new_progress_bonus = 0.0
+
+            # --------------------------------------------
+            # Penalize excessive spinning
+            # --------------------------------------------
+            ang_vel = abs(car.hull.angularVelocity)
+            spin_penalty = 0.1 * max(0.0, ang_vel - 1.0)
+
+            # --------------------------------------------
+            # Penalize taking too long
+            # --------------------------------------------
+            time_penalty = 0.01
+
+            shaped_reward = reward
+            shaped_reward += 0.5 * new_progress_bonus
+            shaped_reward -= spin_penalty
+            shaped_reward -= time_penalty
+
+            info["new_progress_bonus"] = float(new_progress_bonus)
+            info["spin_penalty"] = float(spin_penalty)
+            info["time_penalty"] = float(time_penalty)
+
+        else:
+            raise ValueError(f"Unknown reward mode: {self.mode}")
+
+        info["episode_steps"] = int(self.episode_steps)
+
+        return obs, float(shaped_reward), terminated, truncated, info
+    
 
 # ============================================================
 # Discrete action wrapper
@@ -149,28 +247,6 @@ class DiscreteCarRacingWrapper(gym.ActionWrapper):
     def __init__(self, env: gym.Env):
         super().__init__(env)
         self.action_space = gym.spaces.Discrete(9)
-
-        # v1:
-            # 0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
-            # 1: np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-            # 2: np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            # 3: np.array([0.0, 0.6, 0.0], dtype=np.float32),
-            # 4: np.array([0.0, 0.0, 0.9], dtype=np.float32),
-            # 5: np.array([-0.6, 0.4, 0.0], dtype=np.float32),
-            # 6: np.array([0.6, 0.4, 0.0], dtype=np.float32),
-            # 7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
-            # 8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
-        
-        # v2:
-            # 0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
-            # 1: np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-            # 2: np.array([1.0, 0.0, 0.0], dtype=np.float32),
-            # 3: np.array([0.0, 0.4, 0.0], dtype=np.float32),
-            # 4: np.array([0.0, 0.0, 0.9], dtype=np.float32),
-            # 5: np.array([-0.6, 0.25, 0.0], dtype=np.float32),
-            # 6: np.array([0.6, 0.25, 0.0], dtype=np.float32),
-            # 7: np.array([-0.6, 0.0, 0.9], dtype=np.float32),
-            # 8: np.array([0.6, 0.0, 0.9], dtype=np.float32),
         
         self._actions = {
             0: np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -554,18 +630,26 @@ class PPOAgent:
 # Environment factory
 # ============================================================
 
-def make_env(render: bool = False, seed: int = SEED) -> gym.Env:
+def make_env(render: bool = False, seed: int = SEED, reward_mode: str = "default") -> gym.Env:
     """
     Create and wrap a CarRacing-v3 environment.
 
-    The SAC.py file includes reward-related args, but PPO.py does not need
-    SAC's reward wrapper. So only the overlapping, necessary workflow ideas
-    were copied here. :contentReference[oaicite:1]{index=1}
+    reward_mode:
+      - "default" -> original environment reward
+      - "shaped"  -> new-tile bonus + spin penalty + lap-time penalty
     """
     render_mode = "human" if render else None
     env = gym.make("CarRacing-v3", continuous=True, render_mode=render_mode)
+
+    # First convert discrete action index -> [steer, gas, brake]
     env = DiscreteCarRacingWrapper(env)
+
+    # Then apply reward shaping while observations are still raw
+    env = RewardWrapper(env, mode=reward_mode)
+
+    # Then preprocess the observation frames
     env = CarRacingPreprocess(env)
+
     return env
 
 
@@ -606,20 +690,20 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description="PPO for CarRacing-v3")
 
-    # Training / runtime args that exist in SAC.py
+    # Training / runtime args
     parser.add_argument("--total-timesteps", type=int, default=TOTAL_TIMESTEPS)
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--reward-mode", type=str, default="default", choices=["default", "shaped"], help="Choose whether to use the original reward or the shaped reward.")
 
-    # Evaluation / rendering / resume args that exist in SAC.py
+    # Evaluation / rendering / resume args
     parser.add_argument("--render", action="store_true", help="Render a trained agent using --checkpoint.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt for render/eval mode.")
     parser.add_argument("--load-checkpoint", type=str, default=None, help="Path to .pt to resume training from.")
     parser.add_argument("--start-step", type=int, default=0, help="Initial step count (to match loaded checkpoint).")
 
-    # Output arg that exists in SAC.py
-    parser.add_argument("--save-dir", type=str, default="ppo_results",
-                        help="Directory for checkpoints and logs.")
+    # Output arg
+    parser.add_argument("--save-dir", type=str, default="ppo_results", help="Directory for checkpoints and logs.")
 
     return parser.parse_args()
 
@@ -640,7 +724,7 @@ if __name__ == "__main__":
     maybe_init_csv(log_file)
 
     # Initialize environment and agent
-    env = make_env(render=False, seed=args.seed)
+    env = make_env(render=False, seed=args.seed, reward_mode=args.reward_mode)
     obs, _ = env.reset(seed=args.seed)
 
     cfg = PPOConfig(total_timesteps=args.total_timesteps)
@@ -655,7 +739,7 @@ if __name__ == "__main__":
             step = agent.load(args.checkpoint)
             print(f"[PPO] Loaded checkpoint at step {step}")
 
-            eval_env = make_env(render=True, seed=args.seed)
+            eval_env = make_env(render=True, seed=args.seed, reward_mode=args.reward_mode)
             for ep in range(5):
                 state, _ = eval_env.reset(seed=args.seed + ep)
                 done = False
